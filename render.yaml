@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: movie-api
+    runtime: node
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: TMDB_API_KEY
+        sync: false
+      - key: MOVIE_API_KEY
+        sync: false
+      - key: NODE_ENV
+        value: production

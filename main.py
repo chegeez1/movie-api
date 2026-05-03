@@ -742,6 +742,17 @@ async def download_info(
     }
 
 
+@app.get("/debug/paths")
+async def debug_paths():
+    """List every stream path currently in the cache — use one of these with /debug/resource."""
+    paths = [
+        key.removeprefix("stream:")
+        for key in _cache
+        if key.startswith("stream:")
+    ]
+    return {"cached_stream_paths": sorted(paths), "count": len(paths)}
+
+
 @app.get("/debug/resource/{detail_path:path}")
 async def debug_resource(detail_path: str):
     """Return raw resource + subject data for this title (helps diagnose video URL fields)."""

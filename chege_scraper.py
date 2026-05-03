@@ -363,6 +363,36 @@ class ChegeScraper:
             },
         }
 
+    def get_video_url(self, subject_id: str, ep: int = 1, season: int = 0, resolution: int = 1080) -> Optional[Dict]:
+        """Try to get the direct video/HLS URL from the aoneroom API."""
+        candidates = [
+            "/wefeed-h5api-bff/resource/video",
+            "/wefeed-h5api-bff/resource/episode-video",
+            "/wefeed-h5api-bff/resource/playback",
+            "/wefeed-h5api-bff/resource/video-source",
+        ]
+        for path in candidates:
+            params: Dict = {"subjectId": subject_id, "ep": ep, "resolution": resolution}
+            if season:
+                params["se"] = season
+            data = self._get(path, params=params)
+            if not data:
+                continue
+            inner = data.get("data", {})
+            # Flat URL fields
+            for key in ("url", "videoUrl", "playUrl", "hlsUrl", "m3u8Url", "source", "address", "videoAddress"):
+                val = inner.get(key)
+                if isinstance(val, str) and val.startswith("http"):
+                    return {"url": val, "type": "m3u8" if ".m3u8" in val else "mp4"}
+            # Nested address objects
+            for key in ("videoAddress", "address", "playInfo"):
+                obj = inner.get(key)
+                if isinstance(obj, dict):
+                    val = obj.get("url") or obj.get("address")
+                    if isinstance(val, str) and val.startswith("http"):
+                        return {"url": val, "type": "m3u8" if ".m3u8" in val else "mp4"}
+        return None
+
     def get_related(self, subject_id: str, page: int = 1, per_page: int = 12) -> Dict:
         data = self._get(
             "/wefeed-h5api-bff/subject/detail-rec",

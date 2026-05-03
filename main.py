@@ -149,6 +149,11 @@ _refresh_lock: set = set()
 _server_cache: dict = {}
 SERVER_CACHE_TTL = 600  # 10 minutes — probes are fast but network conditions change
 
+# Video URL cache — populated automatically when users watch via the proxy player
+# key: "subjectId:ep:season:resolution"  value: {url, type, ts}
+_video_url_cache: dict = {}
+VIDEO_URL_TTL = 7200  # 2 hours
+
 
 def _cached(key: str, fn, *args, **kwargs):
     entry = _cache.get(key)
@@ -712,19 +717,48 @@ async def download_info(
         raise HTTPException(status_code=404, detail="Title not found")
 
     safe_title = re.sub(r"[^a-zA-Z0-9_\-]", "_", stream.get("title", detail_path))
+    subject_id = stream.get("id", "")
 
-    # 1. Video URLs already extracted from the resource data (zero extra requests)
+    # 1. Passive-capture cache (populated when anyone watches via the proxy player)
+    if subject_id:
+        vkey = f"{subject_id}:{ep}:{season}:{resolution}"
+        cached = _video_url_cache.get(vkey)
+        if cached and time.time() - cached.get("ts", 0) < VIDEO_URL_TTL:
+            return {
+                "available": True,
+                "url": cached["url"],
+                "type": cached["type"],
+                "filename": f"{safe_title}_{resolution}p.{'m3u8' if cached['type'] == 'm3u8' else 'mp4'}",
+                "source": "cache",
+            }
+
+    # 2. Video URLs already extracted from the resource data (zero extra requests)
     for u in stream.get("_found_video_urls") or []:
         if u.get("ep") == ep and (not season or u.get("season") == season):
-            if abs(u.get("resolution", 0) - resolution) <= 360:  # close-enough quality
+            if abs(u.get("resolution", 0) - resolution) <= 360:
                 return {
                     "available": True,
                     "url": u["url"],
                     "type": "m3u8" if ".m3u8" in u["url"] else "mp4",
                     "filename": f"{safe_title}_{u.get('resolution', resolution)}p.mp4",
+                    "source": "resource",
                 }
 
-    # 2. Trailer fallback (always available for most titles)
+    # 3. Probe netfilm.world (player API + HTML parse)
+    if subject_id:
+        nf_info = scraper.get_video_url_from_netfilm(
+            subject_id, detail_path=detail_path, ep=ep, season=season, resolution=resolution
+        )
+        if nf_info:
+            return {
+                "available": True,
+                "url": nf_info["url"],
+                "type": nf_info["type"],
+                "filename": f"{safe_title}_{resolution}p.{'m3u8' if nf_info['type'] == 'm3u8' else 'mp4'}",
+                "source": "netfilm",
+            }
+
+    # 4. Trailer fallback
     trailer = stream.get("trailer") or {}
     turl = trailer.get("url")
     if turl:
@@ -734,11 +768,12 @@ async def download_info(
             "type": "mp4",
             "filename": f"{safe_title}_trailer.mp4",
             "is_trailer": True,
+            "source": "trailer",
         }
 
     return {
         "available": False,
-        "detail": "No downloadable file found for this title. The full episode download is not yet supported.",
+        "detail": "No downloadable file found for this title.",
     }
 
 
@@ -794,12 +829,26 @@ async def download_movie(
     safe_title = re.sub(r"[^a-zA-Z0-9_\-]", "_", stream.get("title", detail_path))
     subject_id  = stream.get("id", "")
 
-    # 1. Try direct video URL from the aoneroom API
     video_info = None
+
+    # 1. Check the passive-capture cache (populated when anyone watches via the proxy player)
     if subject_id:
+        vkey = f"{subject_id}:{ep}:{season}:{resolution}"
+        cached = _video_url_cache.get(vkey)
+        if cached and time.time() - cached.get("ts", 0) < VIDEO_URL_TTL:
+            video_info = {"url": cached["url"], "type": cached["type"]}
+
+    # 2. Probe netfilm.world directly (player API + HTML parsing)
+    if not video_info and subject_id:
+        video_info = scraper.get_video_url_from_netfilm(
+            subject_id, detail_path=detail_path, ep=ep, season=season, resolution=resolution
+        )
+
+    # 3. Try aoneroom API endpoints
+    if not video_info and subject_id:
         video_info = scraper.get_video_url(subject_id, ep=ep, season=season, resolution=resolution)
 
-    # 2. Fallback: trailer (movies only — better than nothing)
+    # 4. Fallback: trailer
     if not video_info:
         trailer = stream.get("trailer") or {}
         turl = trailer.get("url")
@@ -887,6 +936,27 @@ async def proxy_player(request: Request, path: str = ""):
 
     ct   = r.headers.get("content-type", "")
     body = r.content
+
+    # Passively capture video URLs from JSON API responses that pass through the proxy
+    if "application/json" in ct:
+        try:
+            import json as _json
+            from urllib.parse import parse_qs
+            jdata = _json.loads(body)
+            result = scraper._extract_video_url_from_json(jdata)
+            if result:
+                qs_params = parse_qs(qs)
+                subject_id = (qs_params.get("id") or qs_params.get("subjectId") or [""])[0]
+                ep_val     = (qs_params.get("ep") or ["1"])[0]
+                se_val     = (qs_params.get("se") or ["0"])[0]
+                res_val    = (qs_params.get("resolution") or ["1080"])[0]
+                if subject_id:
+                    vkey = f"{subject_id}:{ep_val}:{se_val}:{res_val}"
+                    _video_url_cache[vkey] = {**result, "ts": time.time()}
+                    import sys
+                    print(f"[proxy-capture] Cached video URL for {vkey}: {result['url'][:80]}", file=sys.stderr)
+        except Exception:
+            pass
 
     if "text/html" in ct or "javascript" in ct or "text/css" in ct:
         text = r.text

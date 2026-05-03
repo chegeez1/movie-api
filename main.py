@@ -243,14 +243,12 @@ def _build_embed_urls(imdb_id: str, media_type: str, season: int, episode: int) 
         return [
             {"label": "Server 1", "url": f"https://vidsrc.to/embed/tv/{imdb_id}/{season}/{episode}"},
             {"label": "Server 2", "url": f"https://vidsrc.me/embed/tv?imdb={imdb_id}&season={season}&episode={episode}"},
-            {"label": "Server 3", "url": f"https://www.2embed.cc/embedtv/{imdb_id}&s={season}&e={episode}"},
-            {"label": "Server 4", "url": f"https://multiembed.mov/?video_id={imdb_id}&tmdb=0&s={season}&e={episode}"},
+            {"label": "Server 3", "url": f"https://embed.su/embed/tv/{imdb_id}/{season}/{episode}"},
         ]
     return [
         {"label": "Server 1", "url": f"https://vidsrc.to/embed/movie/{imdb_id}"},
         {"label": "Server 2", "url": f"https://vidsrc.me/embed/movie?imdb={imdb_id}"},
-        {"label": "Server 3", "url": f"https://www.2embed.cc/embed/{imdb_id}"},
-        {"label": "Server 4", "url": f"https://multiembed.mov/?video_id={imdb_id}&tmdb=0"},
+        {"label": "Server 3", "url": f"https://embed.su/embed/movie/{imdb_id}"},
     ]
 
 

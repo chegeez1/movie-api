@@ -698,6 +698,76 @@ async def get_related(
     }
 
 
+@app.get("/download-info/{detail_path:path}")
+async def download_info(
+    detail_path: str,
+    ep: int = Query(1),
+    season: int = Query(0),
+    resolution: int = Query(1080),
+):
+    """Fast check whether a download is available. Returns JSON, never streams."""
+    cache_key = f"stream:{detail_path}"
+    stream = _cached(cache_key, scraper.get_stream_info, detail_path=detail_path)
+    if not stream:
+        raise HTTPException(status_code=404, detail="Title not found")
+
+    safe_title = re.sub(r"[^a-zA-Z0-9_\-]", "_", stream.get("title", detail_path))
+
+    # 1. Video URLs already extracted from the resource data (zero extra requests)
+    for u in stream.get("_found_video_urls") or []:
+        if u.get("ep") == ep and (not season or u.get("season") == season):
+            if abs(u.get("resolution", 0) - resolution) <= 360:  # close-enough quality
+                return {
+                    "available": True,
+                    "url": u["url"],
+                    "type": "m3u8" if ".m3u8" in u["url"] else "mp4",
+                    "filename": f"{safe_title}_{u.get('resolution', resolution)}p.mp4",
+                }
+
+    # 2. Trailer fallback (always available for most titles)
+    trailer = stream.get("trailer") or {}
+    turl = trailer.get("url")
+    if turl:
+        return {
+            "available": True,
+            "url": turl,
+            "type": "mp4",
+            "filename": f"{safe_title}_trailer.mp4",
+            "is_trailer": True,
+        }
+
+    return {
+        "available": False,
+        "detail": "No downloadable file found for this title. The full episode download is not yet supported.",
+    }
+
+
+@app.get("/debug/resource/{detail_path:path}")
+async def debug_resource(detail_path: str):
+    """Return raw resource + subject data for this title (helps diagnose video URL fields)."""
+    data = scraper._get(
+        "/wefeed-h5api-bff/detail",
+        params={"detailPath": detail_path},
+    )
+    if not data:
+        raise HTTPException(status_code=404, detail="Not found")
+    inner = data.get("data", {})
+    resource = inner.get("resource", {})
+    subject = inner.get("subject", {})
+    seasons_raw = resource.get("seasons") or []
+    # Return first resolution object of each season so we can see all fields
+    sample_resolutions = []
+    for s in seasons_raw[:2]:
+        for r in (s.get("resolutions") or [])[:3]:
+            sample_resolutions.append({"season": s.get("se"), **r})
+    return {
+        "resource_keys": list(resource.keys()),
+        "subject_keys": list(subject.keys()),
+        "sample_resolutions": sample_resolutions,
+        "trailer": subject.get("trailer"),
+    }
+
+
 @app.get("/download/{detail_path:path}")
 async def download_movie(
     detail_path: str,

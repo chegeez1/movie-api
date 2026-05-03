@@ -1080,11 +1080,26 @@ async def proxy_player(request: Request, path: str = ""):
             # Injected FIRST — before any page script runs
             ad_block_script = (
                 "<script>"
-                # Kill window.open immediately
+                # Kill ALL window.open — player has zero reason to open new tabs
                 "window.open=function(){return null;};"
+                # Also try to kill it on parent/top frames (cross-origin will throw, caught below)
+                "try{window.top.open=function(){return null;};}catch(e){}"
+                "try{window.parent.open=function(){return null;};}catch(e){}"
                 "(function(){"
                 "var AD=[" + _AD_HOSTS_JS + "];"
                 "function isAd(u){return AD.some(function(d){return String(u).indexOf(d)>=0;});}"
+                # Walk up the DOM tree and check if any ancestor is an ad anchor
+                "function adAncestorHref(el){"
+                "for(var i=0;i<8&&el;i++,el=el.parentElement){"
+                "var h=(el.href)||(el.getAttribute&&el.getAttribute('href'))||'';"
+                "if(h&&isAd(h))return h;"
+                "if(el.tagName==='A'&&el.target&&el.target!=='_self'){"
+                "var hh=el.href||el.getAttribute('href')||'';"
+                "if(hh)return hh;"  # block any _blank anchor, even non-ad
+                "}"
+                "}"
+                "return null;"
+                "}"
                 # --- location.assign / replace / href ---
                 "var _loc=window.location;"
                 "try{"
@@ -1099,14 +1114,12 @@ async def proxy_player(request: Request, path: str = ""):
                 "Object.defineProperty(window.location,'href',{get:desc.get,set:function(v){if(!isAd(v))origSet.call(window.location,v);}});}"
                 "}catch(e){}"
                 # --- HTMLAnchorElement.prototype.click override ---
-                # This is the KEY fix: blocks detached-anchor-click bypass where ad code does:
-                #   var a=document.createElement('a'); a.href='ad-url'; a.target='_blank'; a.click();
-                # The element may be detached so event listeners on document never fire.
                 "try{"
                 "var _origAClick=HTMLAnchorElement.prototype.click;"
                 "HTMLAnchorElement.prototype.click=function(){"
                 "var h=this.href||this.getAttribute('href')||'';"
                 "if(isAd(h))return;"
+                "if(this.target&&this.target!=='_self'){this.removeAttribute('target');}"
                 "_origAClick.call(this);"
                 "};"
                 "}catch(e){}"
@@ -1120,29 +1133,64 @@ async def proxy_player(request: Request, path: str = ""):
                 "el.click=function(){"
                 "var h=this.href||this.getAttribute('href')||'';"
                 "if(isAd(h))return;"
+                "if(this.target&&this.target!=='_self')this.removeAttribute('target');"
                 "_elClick();"
                 "};"
                 "}"
                 "return el;"
                 "};"
                 "}catch(e){}"
-                # --- Capture-phase click listener (catches attached-to-DOM anchor clicks) ---
-                "document.addEventListener('click',function(e){"
-                "var t=e.target;"
-                "for(var i=0;i<8&&t;i++,t=t.parentElement){"
-                "var h=t.href||(t.getAttribute&&t.getAttribute('href'))||'';"
-                "if(h&&isAd(h)){e.stopImmediatePropagation();e.preventDefault();return;}"
+                # --- Capture-phase event blocker: click, mousedown, pointerdown, auxclick ---
+                # mousedown/pointerdown fires BEFORE click — catches "on-first-click popunder"
+                # auxclick = middle-click → new tab (bypasses window.open!)
+                "function _blkEvt(e){"
+                "if(adAncestorHref(e.target)){e.stopImmediatePropagation();e.preventDefault();}"
                 "}"
-                "},true);"
-                # --- Intercept dispatchEvent to catch synthetic click events on ad anchors ---
+                "['click','mousedown','pointerdown','auxclick'].forEach(function(ev){"
+                "document.addEventListener(ev,_blkEvt,true);"
+                "});"
+                "document.addEventListener('touchstart',function(e){"
+                "if(adAncestorHref(e.target)){e.stopImmediatePropagation();e.preventDefault();}"
+                "},{capture:true,passive:false});"
+                # --- Intercept dispatchEvent to catch synthetic events on ad anchors ---
                 "try{"
                 "var _origDE=EventTarget.prototype.dispatchEvent;"
                 "EventTarget.prototype.dispatchEvent=function(ev){"
-                "if(ev&&ev.type==='click'&&this&&this.tagName==='A'){"
+                "if(ev&&(ev.type==='click'||ev.type==='mousedown')&&this&&this.tagName==='A'){"
                 "var h=this.href||this.getAttribute('href')||'';"
                 "if(isAd(h))return false;"
+                "if(this.target&&this.target!=='_self')return false;"
                 "}"
                 "return _origDE.call(this,ev);"
+                "};"
+                "}catch(e){}"
+                # --- Strip target=_blank from all anchors, existing + future ---
+                "function _stripTargets(root){"
+                "try{"
+                "(root.querySelectorAll?root.querySelectorAll('a[target]'):[]).forEach(function(a){"
+                "a.removeAttribute('target');"
+                "});"
+                "}catch(e){}}"
+                "_stripTargets(document);"
+                "try{"
+                "var _mo=new MutationObserver(function(muts){"
+                "muts.forEach(function(m){"
+                "m.addedNodes.forEach(function(n){"
+                "if(!n||n.nodeType!==1)return;"
+                "if(n.tagName==='A')n.removeAttribute('target');"
+                "else _stripTargets(n);"
+                "});"
+                "});"
+                "});"
+                "_mo.observe(document.documentElement,{childList:true,subtree:true});"
+                "}catch(e){}"
+                # --- Kill form.submit() to ad URLs ---
+                "try{"
+                "var _origSubmit=HTMLFormElement.prototype.submit;"
+                "HTMLFormElement.prototype.submit=function(){"
+                "var a=this.action||'';"
+                "if(isAd(a))return;"
+                "_origSubmit.call(this);"
                 "};"
                 "}catch(e){}"
                 # --- setTimeout/setInterval wrapper (prevents delayed popup tricks) ---
@@ -1197,7 +1245,7 @@ async def proxy_player(request: Request, path: str = ""):
     resp_headers["content-length"]          = str(len(body))
     resp_headers["access-control-allow-origin"] = "*"
 
-    # Browser-enforced: block all navigation out of the player page to non-allowlisted domains
+    # Browser-enforced: block all navigation and popups from the player frame
     if "text/html" in ct:
         resp_headers["content-security-policy"] = (
             "navigate-to 'self' https://movieapi.nasotc.com https://movies.nasotc.com "
@@ -1205,6 +1253,8 @@ async def proxy_player(request: Request, path: str = ""):
             "https://pbcdn.aoneroom.com; "
             "form-action 'self';"
         )
+        # Deny popup permission for this frame AND all nested sub-frames
+        resp_headers["permissions-policy"] = "popups=()"
 
     return Response(content=body, status_code=r.status_code,
                     headers=resp_headers, media_type=ct)

@@ -1122,6 +1122,15 @@ async def proxy_player(request: Request, path: str = ""):
     resp_headers["content-length"]          = str(len(body))
     resp_headers["access-control-allow-origin"] = "*"
 
+    # Browser-enforced: block all navigation out of the player page to non-allowlisted domains
+    if "text/html" in ct:
+        resp_headers["content-security-policy"] = (
+            "navigate-to 'self' https://movieapi.nasotc.com https://movies.nasotc.com "
+            "https://netfilm.world https://h5-api.aoneroom.com https://pbcdnw.aoneroom.com "
+            "https://pbcdn.aoneroom.com; "
+            "form-action 'self';"
+        )
+
     return Response(content=body, status_code=r.status_code,
                     headers=resp_headers, media_type=ct)
 

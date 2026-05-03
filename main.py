@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Query, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse, Response, FileResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from contextlib import asynccontextmanager
@@ -309,31 +309,13 @@ async def _get_ranked_servers(imdb_id: str, media_type: str, season: int, episod
 
 @app.get("/")
 async def root():
+    docs_path = os.path.join(os.path.dirname(__file__), "docs.html")
+    if os.path.exists(docs_path):
+        return FileResponse(docs_path, media_type="text/html")
     return {
         "api": "Chege Movie API",
-        "creator": "Chege",
         "version": "3.0.0",
-        "description": "Live movie data. Powered by Chege.",
-        "endpoints": {
-            "play":            "/play/{detail_path}?ep=1&season=1  → stream + ranked servers (combined)",
-            "movies":          "/movies?page=1&limit=20&type=movie|series&genre=Action&year=2024&country=US",
-            "top_rated":       "/movies/top-rated?limit=20&type=movie|series",
-            "new_releases":    "/movies/new-releases?limit=20&type=movie|series",
-            "similar":         "/movies/similar/{detail_path}?limit=12",
-            "search":          "/movies/search?q=batman&page=1&limit=20",
-            "suggest":         "/movies/suggest?q=bat",
-            "movie_detail":    "/movie/{id}",
-            "trending":        "/trending?page=1&limit=20",
-            "recent":          "/recent?page=1&limit=20",
-            "ranking":         "/ranking?id=&page=1&limit=20",
-            "genres":          "/genres",
-            "popular_searches": "/popular-searches",
-            "imdb_lookup":     "/imdb/lookup?title=inception&year=2010&type=movie",
-            "stream":          "/stream/{detail_path}",
-            "servers":         "/servers?imdb_id=tt1234567&type=movie&season=1&episode=1",
-            "related":         "/related/{subject_id}",
-            "health":          "/health",
-        },
+        "docs": "/docs",
     }
 
 

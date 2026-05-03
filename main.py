@@ -901,6 +901,24 @@ async def download_movie(
 _PLAYER_UPSTREAM   = "https://netfilm.world"
 _PLAYER_PROXY_PATH = f"{_PREFIX}/proxy/player"
 
+# Ad/tracker domains to block at the proxy level (return empty 204)
+_AD_DOMAINS = {
+    "voluum.com", "adcash.com", "adcashdsp.com", "chatmate.tv",
+    "popads.net", "popcash.net", "adsterra.com", "propellerads.com",
+    "hilltopads.net", "exoclick.com", "trafficjunky.com", "juicyads.com",
+    "plugrush.com", "ero-advertising.com", "adspyglass.com",
+    "rotator.adcash.com", "track.voluum.com",
+    "googletagmanager.com", "googlesyndication.com", "doubleclick.net",
+    "adservice.google.com", "amazon-adsystem.com",
+}
+
+# Script tag src patterns to strip from proxied HTML
+_AD_SCRIPT_PATTERNS = [
+    "voluum", "adcash", "popads", "popcash", "adsterra", "propellerads",
+    "hilltopads", "exoclick", "trafficjunky", "juicyads", "plugrush",
+    "googlesyndication", "doubleclick", "adservice.google",
+]
+
 _HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",
@@ -912,6 +930,12 @@ _HOP_BY_HOP = {
 @app.api_route("/proxy/player/{path:path}", methods=["GET", "HEAD", "OPTIONS"])
 async def proxy_player(request: Request, path: str = ""):
     qs = str(request.url.query)
+
+    # Block requests to known ad/tracker domains routed through our proxy
+    for ad_domain in _AD_DOMAINS:
+        if ad_domain in path or ad_domain in qs:
+            return Response(status_code=204, headers={"Access-Control-Allow-Origin": "*"})
+
     upstream_url = f"{_PLAYER_UPSTREAM}/{path}" + (f"?{qs}" if qs else "")
     scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
     host   = request.headers.get("x-forwarded-host",
@@ -964,6 +988,65 @@ async def proxy_player(request: Request, path: str = ""):
         text = text.replace("http://netfilm.world",  proxy_base)
 
         if "text/html" in ct:
+            # Strip <script> tags that load known ad networks
+            import re as _re
+            for pat in _AD_SCRIPT_PATTERNS:
+                text = _re.sub(
+                    r'<script[^>]+src=["\'][^"\']*' + pat + r'[^"\']*["\'][^>]*>.*?</script>',
+                    '', text, flags=_re.IGNORECASE | _re.DOTALL
+                )
+                text = _re.sub(
+                    r'<script[^>]+src=["\'][^"\']*' + pat + r'[^"\']*["\'][^>]*/?>',
+                    '', text, flags=_re.IGNORECASE
+                )
+
+            ad_block_script = (
+                "<script>"
+                # Block window.open (popups / new tab ads)
+                "window.open=function(){return null;};"
+                # Block location redirects — only allow same origin
+                "(function(){"
+                "var _href=Object.getOwnPropertyDescriptor(window.location,'href');"
+                "try{"
+                "var allowed=['movieapi.nasotc.com','movies.nasotc.com','netfilm.world'];"
+                "Object.defineProperty(window,'location',{get:function(){return window.location;},set:function(v){"
+                "var ok=allowed.some(function(d){return String(v).indexOf(d)>=0;});"
+                "if(!ok){console.warn('[ad-block] blocked redirect to',v);return;}"
+                "window.location.href=v;"
+                "}});"
+                "}catch(e){}"
+                "})();"
+                # Kill click-triggered redirects: intercept all clicks and prevent navigation to ad URLs
+                "(function(){"
+                "var AD_HOSTS=['voluum','adcash','chatmate','popads','popcash','adsterra','propellerads','hilltopads','exoclick','trafficjunky','juicyads','plugrush'];"
+                "document.addEventListener('click',function(e){"
+                "var t=e.target;"
+                "while(t){"
+                "var href=t.href||t.getAttribute&&t.getAttribute('href')||'';"
+                "if(href&&AD_HOSTS.some(function(d){return href.indexOf(d)>=0;})){"
+                "e.stopImmediatePropagation();e.preventDefault();"
+                "console.warn('[ad-block] blocked ad click',href);"
+                "return;"
+                "}"
+                "t=t.parentElement;"
+                "}"
+                "},true);"
+                "})();"
+                # Block window.location.assign / replace redirects to ad URLs
+                "(function(){"
+                "var AD_HOSTS=['voluum','adcash','chatmate','popads','popcash','adsterra','propellerads','hilltopads','exoclick','trafficjunky'];"
+                "var _assign=window.location.assign.bind(window.location);"
+                "var _replace=window.location.replace.bind(window.location);"
+                "window.location.assign=function(u){"
+                "if(AD_HOSTS.some(function(d){return String(u).indexOf(d)>=0;})){console.warn('[ad-block] blocked assign',u);return;}"
+                "_assign(u);};"
+                "window.location.replace=function(u){"
+                "if(AD_HOSTS.some(function(d){return String(u).indexOf(d)>=0;})){console.warn('[ad-block] blocked replace',u);return;}"
+                "_replace(u);};"
+                "})();"
+                "</script>"
+            )
+
             fix_script = (
                 "<script>"
                 "(function(){"
@@ -992,7 +1075,7 @@ async def proxy_player(request: Request, path: str = ""):
                 "})();"
                 "</script>"
             )
-            text = text.replace("</head>", fix_script + "</head>", 1)
+            text = text.replace("</head>", ad_block_script + fix_script + "</head>", 1)
 
         body = text.encode("utf-8")
 

@@ -913,6 +913,9 @@ _AD_DOMAINS = {
     "bidvertiser.com", "zedo.com", "undertone.com", "smartadserver.com",
     "adnxs.com", "adsrvr.org", "rubiconproject.com", "openx.net",
     "pubmatic.com", "criteo.com", "media.net",
+    "phiglerdail.net", "phigler", "clickadu.com", "trafficshop.com",
+    "adpushup.com", "monetag.com", "richpush.co", "pushground.com",
+    "evadav.com", "adoperator.com", "trafficker.com",
 }
 
 # Keyword patterns to match ad domains/paths in proxied requests
@@ -921,6 +924,7 @@ _AD_URL_KEYWORDS = [
     "popads", "popcash", "adsterra", "propellerads", "hilltopads",
     "exoclick", "trafficjunky", "juicyads", "plugrush", "mgid",
     "googlesyndication", "doubleclick", "adservice.google",
+    "phiglerdail", "phigler", "clickadu", "monetag", "richpush",
 ]
 
 # Script tag src patterns to strip from proxied HTML
@@ -1030,19 +1034,21 @@ async def proxy_player(request: Request, path: str = ""):
                 "'v2006','afu.php','adex','voluum','adcash','chatmate',"
                 "'popads','popcash','adsterra','propellerads','hilltopads',"
                 "'exoclick','trafficjunky','juicyads','plugrush','mgid',"
-                "'revcontent','outbrain','taboola'"
+                "'revcontent','outbrain','taboola','phiglerdail','phigler',"
+                "'clickadu','monetag','richpush','pushground','evadav',"
+                "'bidvertiser','zedo','adspyglass','ero-advertising',"
+                "'smartadserver','adnxs','adsrvr','rubiconproject'"
             )
 
             # Injected FIRST — before any page script runs
             ad_block_script = (
                 "<script>"
-                # Override window.open immediately — kills all popup/new-tab ads
+                # Kill window.open immediately
                 "window.open=function(){return null;};"
-                # Override window.location setters before page scripts load
                 "(function(){"
                 "var AD=[" + _AD_HOSTS_JS + "];"
                 "function isAd(u){return AD.some(function(d){return String(u).indexOf(d)>=0;});}"
-                # Wrap assign/replace
+                # --- location.assign / replace / href ---
                 "var _loc=window.location;"
                 "try{"
                 "var _assign=_loc.assign.bind(_loc);"
@@ -1050,30 +1056,64 @@ async def proxy_player(request: Request, path: str = ""):
                 "Object.defineProperty(window.location,'assign',{value:function(u){if(!isAd(u))_assign(u);}});"
                 "Object.defineProperty(window.location,'replace',{value:function(u){if(!isAd(u))_replace(u);}});"
                 "}catch(e){}"
-                # Intercept href setter
                 "try{"
                 "var desc=Object.getOwnPropertyDescriptor(window.location,'href');"
                 "if(desc&&desc.set){var origSet=desc.set;"
                 "Object.defineProperty(window.location,'href',{get:desc.get,set:function(v){if(!isAd(v))origSet.call(window.location,v);}});}"
                 "}catch(e){}"
-                "})();"
-                # Capture-phase click listener — block anchor navigations to ad URLs
-                "(function(){"
-                "var AD=[" + _AD_HOSTS_JS + "];"
+                # --- HTMLAnchorElement.prototype.click override ---
+                # This is the KEY fix: blocks detached-anchor-click bypass where ad code does:
+                #   var a=document.createElement('a'); a.href='ad-url'; a.target='_blank'; a.click();
+                # The element may be detached so event listeners on document never fire.
+                "try{"
+                "var _origAClick=HTMLAnchorElement.prototype.click;"
+                "HTMLAnchorElement.prototype.click=function(){"
+                "var h=this.href||this.getAttribute('href')||'';"
+                "if(isAd(h))return;"
+                "_origAClick.call(this);"
+                "};"
+                "}catch(e){}"
+                # --- document.createElement wrapper: patch <a> elements at creation time ---
+                "try{"
+                "var _origCE=document.createElement.bind(document);"
+                "document.createElement=function(tag){"
+                "var el=_origCE(tag);"
+                "if(typeof tag==='string'&&tag.toLowerCase()==='a'){"
+                "var _elClick=el.click.bind(el);"
+                "el.click=function(){"
+                "var h=this.href||this.getAttribute('href')||'';"
+                "if(isAd(h))return;"
+                "_elClick();"
+                "};"
+                "}"
+                "return el;"
+                "};"
+                "}catch(e){}"
+                # --- Capture-phase click listener (catches attached-to-DOM anchor clicks) ---
                 "document.addEventListener('click',function(e){"
                 "var t=e.target;"
                 "for(var i=0;i<8&&t;i++,t=t.parentElement){"
                 "var h=t.href||(t.getAttribute&&t.getAttribute('href'))||'';"
-                "if(h&&AD.some(function(d){return h.indexOf(d)>=0;})){"
-                "e.stopImmediatePropagation();e.preventDefault();return;}}"
+                "if(h&&isAd(h)){e.stopImmediatePropagation();e.preventDefault();return;}"
+                "}"
                 "},true);"
-                # Also intercept setTimeout/setInterval that might fire after page load
+                # --- Intercept dispatchEvent to catch synthetic click events on ad anchors ---
+                "try{"
+                "var _origDE=EventTarget.prototype.dispatchEvent;"
+                "EventTarget.prototype.dispatchEvent=function(ev){"
+                "if(ev&&ev.type==='click'&&this&&this.tagName==='A'){"
+                "var h=this.href||this.getAttribute('href')||'';"
+                "if(isAd(h))return false;"
+                "}"
+                "return _origDE.call(this,ev);"
+                "};"
+                "}catch(e){}"
+                # --- setTimeout/setInterval wrapper (prevents delayed popup tricks) ---
                 "var _sT=window.setTimeout,_sI=window.setInterval;"
-                "var AD2=[" + _AD_HOSTS_JS + "];"
                 "function wrapFn(fn){"
                 "if(typeof fn!=='function')return fn;"
-                "return function(){try{fn.apply(this,arguments);}catch(e){}"
-                "}}"
+                "return function(){try{fn.apply(this,arguments);}catch(e){}}"
+                "}"
                 "window.setTimeout=function(fn,d){return _sT(wrapFn(fn),d);};"
                 "window.setInterval=function(fn,d){return _sI(wrapFn(fn),d);};"
                 "})();"

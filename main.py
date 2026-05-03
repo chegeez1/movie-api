@@ -910,13 +910,35 @@ _AD_DOMAINS = {
     "rotator.adcash.com", "track.voluum.com",
     "googletagmanager.com", "googlesyndication.com", "doubleclick.net",
     "adservice.google.com", "amazon-adsystem.com",
+    "v2006.com", "adex.com", "afu.php",
+    "mgid.com", "revcontent.com", "outbrain.com", "taboola.com",
+    "bidvertiser.com", "zedo.com", "undertone.com", "smartadserver.com",
+    "adnxs.com", "adsrvr.org", "rubiconproject.com", "openx.net",
+    "pubmatic.com", "criteo.com", "media.net",
 }
+
+# Keyword patterns to match ad domains/paths in proxied requests
+_AD_URL_KEYWORDS = [
+    "v2006.com", "adex.com", "afu.php", "voluum", "adcash", "chatmate",
+    "popads", "popcash", "adsterra", "propellerads", "hilltopads",
+    "exoclick", "trafficjunky", "juicyads", "plugrush", "mgid",
+    "googlesyndication", "doubleclick", "adservice.google",
+]
 
 # Script tag src patterns to strip from proxied HTML
 _AD_SCRIPT_PATTERNS = [
-    "voluum", "adcash", "popads", "popcash", "adsterra", "propellerads",
+    "voluum", "adcash", "v2006", "adex\\.com", "afu\\.php",
+    "popads", "popcash", "adsterra", "propellerads",
     "hilltopads", "exoclick", "trafficjunky", "juicyads", "plugrush",
-    "googlesyndication", "doubleclick", "adservice.google",
+    "googlesyndication", "doubleclick", "adservice\\.google",
+    "mgid", "revcontent", "outbrain", "taboola",
+]
+
+# JS code patterns to scrub from proxied JavaScript/HTML (redirect patterns)
+_AD_JS_PATTERNS = [
+    r'window\.open\s*\([^)]*(?:v2006|adcash|voluum|chatmate|popads|adsterra|propellerads|hilltopads|exoclick|afu\.php)[^)]*\)',
+    r'(?:location|window\.location)\s*(?:\.href|\.assign|\.replace)?\s*=\s*["\'][^"\']*(?:v2006|adcash|voluum|chatmate|popads|adsterra)[^"\']*["\']',
+    r'document\.createElement\s*\(\s*["\']script["\']\s*\)[^;]*(?:v2006|adcash|voluum|afu\.php)',
 ]
 
 _HOP_BY_HOP = {
@@ -932,8 +954,9 @@ async def proxy_player(request: Request, path: str = ""):
     qs = str(request.url.query)
 
     # Block requests to known ad/tracker domains routed through our proxy
-    for ad_domain in _AD_DOMAINS:
-        if ad_domain in path or ad_domain in qs:
+    combined = path + "?" + qs
+    for kw in _AD_URL_KEYWORDS:
+        if kw in combined:
             return Response(status_code=204, headers={"Access-Control-Allow-Origin": "*"})
 
     upstream_url = f"{_PLAYER_UPSTREAM}/{path}" + (f"?{qs}" if qs else "")
@@ -983,13 +1006,17 @@ async def proxy_player(request: Request, path: str = ""):
             pass
 
     if "text/html" in ct or "javascript" in ct or "text/css" in ct:
+        import re as _re
         text = r.text
         text = text.replace("https://netfilm.world", proxy_base)
         text = text.replace("http://netfilm.world",  proxy_base)
 
+        # Scrub known ad redirect code from ALL text content (HTML + JS)
+        for js_pat in _AD_JS_PATTERNS:
+            text = _re.sub(js_pat, "void 0", text, flags=_re.IGNORECASE | _re.DOTALL)
+
         if "text/html" in ct:
-            # Strip <script> tags that load known ad networks
-            import re as _re
+            # Strip entire <script> tags whose src points to ad networks
             for pat in _AD_SCRIPT_PATTERNS:
                 text = _re.sub(
                     r'<script[^>]+src=["\'][^"\']*' + pat + r'[^"\']*["\'][^>]*>.*?</script>',
@@ -1000,49 +1027,57 @@ async def proxy_player(request: Request, path: str = ""):
                     '', text, flags=_re.IGNORECASE
                 )
 
+            # Full ad-host list used by injected JS
+            _AD_HOSTS_JS = (
+                "'v2006','afu.php','adex','voluum','adcash','chatmate',"
+                "'popads','popcash','adsterra','propellerads','hilltopads',"
+                "'exoclick','trafficjunky','juicyads','plugrush','mgid',"
+                "'revcontent','outbrain','taboola'"
+            )
+
+            # Injected FIRST — before any page script runs
             ad_block_script = (
                 "<script>"
-                # Block window.open (popups / new tab ads)
+                # Override window.open immediately — kills all popup/new-tab ads
                 "window.open=function(){return null;};"
-                # Block location redirects — only allow same origin
+                # Override window.location setters before page scripts load
                 "(function(){"
-                "var _href=Object.getOwnPropertyDescriptor(window.location,'href');"
+                "var AD=[" + _AD_HOSTS_JS + "];"
+                "function isAd(u){return AD.some(function(d){return String(u).indexOf(d)>=0;});}"
+                # Wrap assign/replace
+                "var _loc=window.location;"
                 "try{"
-                "var allowed=['movieapi.nasotc.com','movies.nasotc.com','netfilm.world'];"
-                "Object.defineProperty(window,'location',{get:function(){return window.location;},set:function(v){"
-                "var ok=allowed.some(function(d){return String(v).indexOf(d)>=0;});"
-                "if(!ok){console.warn('[ad-block] blocked redirect to',v);return;}"
-                "window.location.href=v;"
-                "}});"
+                "var _assign=_loc.assign.bind(_loc);"
+                "var _replace=_loc.replace.bind(_loc);"
+                "Object.defineProperty(window.location,'assign',{value:function(u){if(!isAd(u))_assign(u);}});"
+                "Object.defineProperty(window.location,'replace',{value:function(u){if(!isAd(u))_replace(u);}});"
+                "}catch(e){}"
+                # Intercept href setter
+                "try{"
+                "var desc=Object.getOwnPropertyDescriptor(window.location,'href');"
+                "if(desc&&desc.set){var origSet=desc.set;"
+                "Object.defineProperty(window.location,'href',{get:desc.get,set:function(v){if(!isAd(v))origSet.call(window.location,v);}});}"
                 "}catch(e){}"
                 "})();"
-                # Kill click-triggered redirects: intercept all clicks and prevent navigation to ad URLs
+                # Capture-phase click listener — block anchor navigations to ad URLs
                 "(function(){"
-                "var AD_HOSTS=['voluum','adcash','chatmate','popads','popcash','adsterra','propellerads','hilltopads','exoclick','trafficjunky','juicyads','plugrush'];"
+                "var AD=[" + _AD_HOSTS_JS + "];"
                 "document.addEventListener('click',function(e){"
                 "var t=e.target;"
-                "while(t){"
-                "var href=t.href||t.getAttribute&&t.getAttribute('href')||'';"
-                "if(href&&AD_HOSTS.some(function(d){return href.indexOf(d)>=0;})){"
-                "e.stopImmediatePropagation();e.preventDefault();"
-                "console.warn('[ad-block] blocked ad click',href);"
-                "return;"
-                "}"
-                "t=t.parentElement;"
-                "}"
+                "for(var i=0;i<8&&t;i++,t=t.parentElement){"
+                "var h=t.href||(t.getAttribute&&t.getAttribute('href'))||'';"
+                "if(h&&AD.some(function(d){return h.indexOf(d)>=0;})){"
+                "e.stopImmediatePropagation();e.preventDefault();return;}}"
                 "},true);"
-                "})();"
-                # Block window.location.assign / replace redirects to ad URLs
-                "(function(){"
-                "var AD_HOSTS=['voluum','adcash','chatmate','popads','popcash','adsterra','propellerads','hilltopads','exoclick','trafficjunky'];"
-                "var _assign=window.location.assign.bind(window.location);"
-                "var _replace=window.location.replace.bind(window.location);"
-                "window.location.assign=function(u){"
-                "if(AD_HOSTS.some(function(d){return String(u).indexOf(d)>=0;})){console.warn('[ad-block] blocked assign',u);return;}"
-                "_assign(u);};"
-                "window.location.replace=function(u){"
-                "if(AD_HOSTS.some(function(d){return String(u).indexOf(d)>=0;})){console.warn('[ad-block] blocked replace',u);return;}"
-                "_replace(u);};"
+                # Also intercept setTimeout/setInterval that might fire after page load
+                "var _sT=window.setTimeout,_sI=window.setInterval;"
+                "var AD2=[" + _AD_HOSTS_JS + "];"
+                "function wrapFn(fn){"
+                "if(typeof fn!=='function')return fn;"
+                "return function(){try{fn.apply(this,arguments);}catch(e){}"
+                "}}"
+                "window.setTimeout=function(fn,d){return _sT(wrapFn(fn),d);};"
+                "window.setInterval=function(fn,d){return _sI(wrapFn(fn),d);};"
                 "})();"
                 "</script>"
             )
@@ -1075,7 +1110,11 @@ async def proxy_player(request: Request, path: str = ""):
                 "})();"
                 "</script>"
             )
-            text = text.replace("</head>", ad_block_script + fix_script + "</head>", 1)
+            # Inject ad-block script at the VERY TOP of <head> so it runs before any page script
+            text = text.replace("<head>", "<head>" + ad_block_script, 1)
+            if "<head>" not in text:
+                text = text.replace("<html", "<head>" + ad_block_script + "</head><html", 1)
+            text = text.replace("</body>", fix_script + "</body>", 1)
 
         body = text.encode("utf-8")
 

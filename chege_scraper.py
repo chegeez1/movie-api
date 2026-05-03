@@ -1,3 +1,4 @@
+import re
 import requests
 import time
 import urllib.parse
@@ -387,6 +388,114 @@ class ChegeScraper:
             "_found_video_urls": _found_video_urls,
             "_raw_resource_keys": list(resource.keys()),
         }
+
+    def get_video_url_from_netfilm(self, subject_id: str, detail_path: str = "", ep: int = 1, season: int = 0, resolution: int = 1080) -> Optional[Dict]:
+        """Fetch the netfilm.world player page and extract the video URL from HTML/JS or its API."""
+        import sys
+
+        player_headers = {
+            "User-Agent": HEADERS["User-Agent"],
+            "Referer": PLAYER_URL + "/",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+
+        # 1. Try netfilm.world internal API endpoints (the player's JS calls these)
+        netfilm_api_candidates = [
+            f"{PLAYER_URL}/api/video",
+            f"{PLAYER_URL}/api/source",
+            f"{PLAYER_URL}/api/stream",
+            f"{PLAYER_URL}/api/play",
+            f"{PLAYER_URL}/api/player",
+        ]
+        params: Dict = {"id": subject_id, "ep": ep, "resolution": resolution}
+        if season:
+            params["se"] = season
+
+        api_headers = {
+            "User-Agent": HEADERS["User-Agent"],
+            "Referer": PLAYER_URL + "/",
+            "Accept": "application/json",
+        }
+
+        for api_url in netfilm_api_candidates:
+            try:
+                r = self.session.get(api_url, params=params, headers=api_headers, timeout=5)
+                if r.status_code == 200 and "application/json" in r.headers.get("content-type", ""):
+                    data = r.json()
+                    result = self._extract_video_url_from_json(data)
+                    if result:
+                        print(f"[netfilm-api] Found video URL via {api_url}", file=sys.stderr)
+                        return result
+            except Exception:
+                pass
+
+        # 2. Fetch the player page HTML and parse for video URLs
+        if not detail_path:
+            return None
+        try:
+            page_url = f"{PLAYER_URL}/movies/{detail_path}?id={subject_id}&ep={ep}&resolution={resolution}"
+            if season:
+                page_url += f"&se={season}"
+            r = self.session.get(page_url, headers=player_headers, timeout=10)
+            text = r.text
+
+            # Look for HLS / MP4 URLs in the HTML/inline JS
+            url_patterns = [
+                r'["\']?(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)["\']?',
+                r'["\']?(https?://[^\s\'"<>]+\.mp4[^\s\'"<>]*)["\']?',
+                r'(?:src|url|source|videoUrl|playUrl)\s*[:=]\s*["\']?(https?://[^\s\'"<>]+)["\']?',
+            ]
+            for pat in url_patterns:
+                matches = re.findall(pat, text, re.IGNORECASE)
+                for m in matches:
+                    m = m.strip('"\'')
+                    if any(kw in m.lower() for kw in [".m3u8", ".mp4", "video", "stream", "cdn", "hls"]):
+                        vtype = "m3u8" if ".m3u8" in m else "mp4"
+                        print(f"[netfilm-html] Found {vtype} URL: {m[:80]}", file=sys.stderr)
+                        return {"url": m, "type": vtype}
+
+            # Look for embedded JSON blobs that might contain the video URL
+            json_blobs = re.findall(r'\{[^{}]{20,}\}', text)
+            for blob in json_blobs[:30]:
+                try:
+                    import json as _json
+                    d = _json.loads(blob)
+                    result = self._extract_video_url_from_json(d)
+                    if result:
+                        return result
+                except Exception:
+                    pass
+
+        except Exception as e:
+            print(f"[netfilm-html] Error: {e}", file=sys.stderr)
+
+        return None
+
+    def _extract_video_url_from_json(self, data: Any) -> Optional[Dict]:
+        """Recursively search a JSON structure for a video URL."""
+        if isinstance(data, str):
+            if data.startswith("http") and (".m3u8" in data or ".mp4" in data):
+                return {"url": data, "type": "m3u8" if ".m3u8" in data else "mp4"}
+            return None
+        if isinstance(data, dict):
+            # Direct URL fields
+            for key in ("url", "videoUrl", "playUrl", "hlsUrl", "m3u8Url", "source",
+                        "address", "videoAddress", "streamUrl", "mediaUrl", "fileUrl"):
+                val = data.get(key)
+                if isinstance(val, str) and val.startswith("http"):
+                    if any(kw in val for kw in [".m3u8", ".mp4", "video", "stream", "cdn", "hls"]):
+                        return {"url": val, "type": "m3u8" if ".m3u8" in val else "mp4"}
+            # Recurse into nested dicts/lists
+            for v in data.values():
+                result = self._extract_video_url_from_json(v)
+                if result:
+                    return result
+        if isinstance(data, list):
+            for item in data[:10]:
+                result = self._extract_video_url_from_json(item)
+                if result:
+                    return result
+        return None
 
     def get_video_url(self, subject_id: str, ep: int = 1, season: int = 0, resolution: int = 1080) -> Optional[Dict]:
         """Try to get the direct video/HLS URL from the aoneroom API (3s per attempt, fail fast)."""

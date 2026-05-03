@@ -699,27 +699,72 @@ async def get_related(
 
 
 @app.get("/download/{detail_path:path}")
-async def download_trailer(detail_path: str):
+async def download_movie(
+    detail_path: str,
+    ep: int = Query(1),
+    season: int = Query(0),
+    resolution: int = Query(1080),
+):
     cache_key = f"stream:{detail_path}"
-    result = _cached(cache_key, scraper.get_stream_info, detail_path=detail_path)
-    if not result:
+    stream = _cached(cache_key, scraper.get_stream_info, detail_path=detail_path)
+    if not stream:
         raise HTTPException(status_code=404, detail="Title not found")
-    trailer = result.get("trailer")
-    if not trailer or not trailer.get("url"):
-        raise HTTPException(status_code=404, detail="No downloadable trailer available")
-    trailer_url = trailer["url"]
-    safe_title = re.sub(r"[^a-zA-Z0-9_\-]", "_", result.get("title", detail_path))
-    filename = f"{safe_title}_trailer.mp4"
 
-    async def stream_file():
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            async with client.stream("GET", trailer_url, headers={"Referer": "https://moviebox.ac"}) as r:
-                async for chunk in r.aiter_bytes(chunk_size=65536):
+    safe_title = re.sub(r"[^a-zA-Z0-9_\-]", "_", stream.get("title", detail_path))
+    subject_id  = stream.get("id", "")
+
+    # 1. Try direct video URL from the aoneroom API
+    video_info = None
+    if subject_id:
+        video_info = scraper.get_video_url(subject_id, ep=ep, season=season, resolution=resolution)
+
+    # 2. Fallback: trailer (movies only — better than nothing)
+    if not video_info:
+        trailer = stream.get("trailer") or {}
+        turl = trailer.get("url")
+        if turl:
+            video_info  = {"url": turl, "type": "mp4"}
+            safe_title  = f"{safe_title}_trailer"
+
+    if not video_info:
+        raise HTTPException(
+            status_code=404,
+            detail="No downloadable file found. Open the watch page and use the player's download option.",
+        )
+
+    video_url = video_info["url"]
+    is_hls    = video_info.get("type") == "m3u8" or ".m3u8" in video_url
+
+    dl_headers = {
+        "Referer":    "https://moviebox.ac",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+
+    if is_hls:
+        # Stream the m3u8 manifest — download managers (IDM, aria2c) can handle HLS
+        async def stream_hls():
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                async with client.stream("GET", video_url, headers=dl_headers) as r:
+                    async for chunk in r.aiter_bytes(65536):
+                        yield chunk
+        return StreamingResponse(
+            stream_hls(),
+            media_type="application/x-mpegURL",
+            headers={"Content-Disposition": f'attachment; filename="{safe_title}.m3u8"',
+                     "Access-Control-Allow-Origin": "*"},
+        )
+
+    # Direct MP4 — stream through our server with range support
+    async def stream_mp4():
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+            async with client.stream("GET", video_url, headers=dl_headers) as r:
+                async for chunk in r.aiter_bytes(65536):
                     yield chunk
-
     return StreamingResponse(
-        stream_file(), media_type="video/mp4",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        stream_mp4(),
+        media_type="video/mp4",
+        headers={"Content-Disposition": f'attachment; filename="{safe_title}.mp4"',
+                 "Access-Control-Allow-Origin": "*"},
     )
 
 

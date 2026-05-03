@@ -42,9 +42,9 @@ class ChegeScraper:
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
 
-    def _get(self, path: str, params: Dict = None) -> Optional[Dict]:
+    def _get(self, path: str, params: Dict = None, timeout: int = 15) -> Optional[Dict]:
         try:
-            r = self.session.get(f"{UPSTREAM_API}{path}", params=params, timeout=15)
+            r = self.session.get(f"{UPSTREAM_API}{path}", params=params, timeout=timeout)
             data = r.json()
             return data if data.get("code") == 0 else None
         except Exception:
@@ -302,6 +302,8 @@ class ChegeScraper:
 
         seasons_raw = resource.get("seasons") or []
         seasons = []
+        # Also collect all video URLs we find in the resource data
+        _found_video_urls: List[Dict] = []
         for s in seasons_raw:
             season_num = s.get("se", 0)
             resolutions = s.get("resolutions") or []
@@ -312,6 +314,27 @@ class ChegeScraper:
                 "episode_count": max_ep,
                 "resolutions": available_res,
             })
+            # Try to extract video URLs from the raw resolution objects
+            for r in resolutions:
+                for key in ("url", "videoUrl", "playUrl", "hlsUrl", "m3u8Url", "address"):
+                    val = r.get(key)
+                    if isinstance(val, str) and val.startswith("http"):
+                        _found_video_urls.append({
+                            "url": val,
+                            "resolution": r.get("resolution", 0),
+                            "ep": r.get("epNum", 1),
+                            "season": season_num,
+                        })
+                addr = r.get("videoAddress") or r.get("address") or {}
+                if isinstance(addr, dict):
+                    val = addr.get("url") or addr.get("address")
+                    if isinstance(val, str) and val.startswith("http"):
+                        _found_video_urls.append({
+                            "url": val,
+                            "resolution": r.get("resolution", 0),
+                            "ep": r.get("epNum", 1),
+                            "season": season_num,
+                        })
 
         trailer_url = trailer_address.get("url")
         trailer_duration = trailer_address.get("duration")
@@ -361,21 +384,24 @@ class ChegeScraper:
             "player": {
                 "embed_url": build_embed(ep=1, resolution=default_resolution, season=default_season),
             },
+            "_found_video_urls": _found_video_urls,
+            "_raw_resource_keys": list(resource.keys()),
         }
 
     def get_video_url(self, subject_id: str, ep: int = 1, season: int = 0, resolution: int = 1080) -> Optional[Dict]:
-        """Try to get the direct video/HLS URL from the aoneroom API."""
+        """Try to get the direct video/HLS URL from the aoneroom API (3s per attempt, fail fast)."""
         candidates = [
             "/wefeed-h5api-bff/resource/video",
             "/wefeed-h5api-bff/resource/episode-video",
             "/wefeed-h5api-bff/resource/playback",
             "/wefeed-h5api-bff/resource/video-source",
+            "/wefeed-h5api-bff/resource/video-address",
         ]
         for path in candidates:
             params: Dict = {"subjectId": subject_id, "ep": ep, "resolution": resolution}
             if season:
                 params["se"] = season
-            data = self._get(path, params=params)
+            data = self._get(path, params=params, timeout=3)
             if not data:
                 continue
             inner = data.get("data", {})
@@ -383,14 +409,17 @@ class ChegeScraper:
             for key in ("url", "videoUrl", "playUrl", "hlsUrl", "m3u8Url", "source", "address", "videoAddress"):
                 val = inner.get(key)
                 if isinstance(val, str) and val.startswith("http"):
-                    return {"url": val, "type": "m3u8" if ".m3u8" in val else "mp4"}
+                    return {"url": val, "type": "m3u8" if ".m3u8" in val else "mp4", "endpoint": path}
             # Nested address objects
             for key in ("videoAddress", "address", "playInfo"):
                 obj = inner.get(key)
                 if isinstance(obj, dict):
                     val = obj.get("url") or obj.get("address")
                     if isinstance(val, str) and val.startswith("http"):
-                        return {"url": val, "type": "m3u8" if ".m3u8" in val else "mp4"}
+                        return {"url": val, "type": "m3u8" if ".m3u8" in val else "mp4", "endpoint": path}
+            # Log what we got back so we can tune the endpoint discovery
+            import sys
+            print(f"[download-probe] {path} -> keys={list(inner.keys())}", file=sys.stderr)
         return None
 
     def get_related(self, subject_id: str, page: int = 1, per_page: int = 12) -> Dict:

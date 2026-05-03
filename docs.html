@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Chege Movie API — Docs</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --red:#e50914;--red-dim:#b00710;
+  --bg:#0a0a0a;--surface:#111;--surface2:#1a1a1a;--surface3:#222;
+  --border:#2a2a2a;--text:#e8e8e8;--muted:#888;--code:#f0a500;
+}
+body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;line-height:1.6}
+a{color:var(--red);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* NAV */
+nav{position:sticky;top:0;z-index:50;background:rgba(10,10,10,.92);backdrop-filter:blur(12px);border-bottom:1px solid var(--border);padding:0 2rem;display:flex;align-items:center;gap:2rem;height:60px}
+.nav-logo{display:flex;align-items:center;gap:.6rem;font-weight:700;font-size:1.1rem;color:#fff}
+.nav-logo svg{flex-shrink:0}
+.nav-links{display:flex;gap:1.5rem;margin-left:auto}
+.nav-links a{color:var(--muted);font-size:.85rem;transition:color .2s}
+.nav-links a:hover{color:#fff;text-decoration:none}
+.badge-live{background:var(--red);color:#fff;font-size:.65rem;font-weight:700;padding:2px 7px;border-radius:99px;letter-spacing:.05em}
+
+/* HERO */
+.hero{padding:5rem 2rem 3.5rem;text-align:center;background:linear-gradient(180deg,#1a0000 0%,var(--bg) 100%)}
+.hero-eyebrow{color:var(--red);font-size:.8rem;font-weight:700;letter-spacing:.15em;text-transform:uppercase;margin-bottom:1rem}
+.hero h1{font-size:clamp(2rem,5vw,3.2rem);font-weight:800;line-height:1.1;margin-bottom:1rem}
+.hero h1 span{color:var(--red)}
+.hero p{color:var(--muted);font-size:1.05rem;max-width:560px;margin:0 auto 2rem}
+.hero-base{display:inline-flex;align-items:center;gap:.75rem;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:.65rem 1.2rem;font-family:monospace;font-size:.95rem;color:var(--code)}
+.copy-btn{background:var(--red);border:none;color:#fff;padding:.3rem .7rem;border-radius:6px;font-size:.75rem;cursor:pointer;font-weight:600;transition:background .2s}
+.copy-btn:hover{background:var(--red-dim)}
+
+/* STATS */
+.stats{display:flex;justify-content:center;gap:3rem;padding:2rem;flex-wrap:wrap}
+.stat{text-align:center}
+.stat-num{font-size:2rem;font-weight:800;color:var(--red)}
+.stat-label{color:var(--muted);font-size:.8rem;margin-top:.2rem}
+
+/* LAYOUT */
+.layout{display:grid;grid-template-columns:220px 1fr;gap:0;max-width:1280px;margin:0 auto;padding:0 1rem 4rem}
+@media(max-width:768px){.layout{grid-template-columns:1fr}.sidebar{display:none}}
+
+/* SIDEBAR */
+.sidebar{position:sticky;top:60px;height:calc(100vh - 60px);overflow-y:auto;padding:2rem 1.5rem;border-right:1px solid var(--border)}
+.sidebar-section{margin-bottom:1.5rem}
+.sidebar-title{font-size:.7rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin-bottom:.5rem}
+.sidebar a{display:block;font-size:.83rem;color:var(--muted);padding:.3rem .5rem;border-radius:5px;transition:all .2s}
+.sidebar a:hover,.sidebar a.active{background:var(--surface2);color:#fff;text-decoration:none}
+
+/* CONTENT */
+.content{padding:2rem 2.5rem}
+
+/* SECTION */
+.section{margin-bottom:3rem}
+.section-header{display:flex;align-items:center;gap:.75rem;margin-bottom:1.5rem;padding-bottom:.75rem;border-bottom:1px solid var(--border)}
+.section-icon{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0}
+.section-header h2{font-size:1.2rem;font-weight:700}
+.section-header p{color:var(--muted);font-size:.85rem}
+
+/* ENDPOINT CARD */
+.ep-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:1rem;overflow:hidden;transition:border-color .2s}
+.ep-card:hover{border-color:#3a3a3a}
+.ep-header{display:flex;align-items:center;gap:1rem;padding:1rem 1.2rem;cursor:pointer;user-select:none}
+.ep-header:hover{background:var(--surface2)}
+.method{font-size:.72rem;font-weight:800;padding:.3rem .6rem;border-radius:5px;min-width:48px;text-align:center;letter-spacing:.05em}
+.GET{background:#0d3b1f;color:#4ade80}
+.POST{background:#1a2b4a;color:#60a5fa}
+.DELETE{background:#3b0d0d;color:#f87171}
+.ep-path{font-family:monospace;font-size:.9rem;color:#fff;flex:1}
+.ep-desc{color:var(--muted);font-size:.82rem;margin-left:auto;white-space:nowrap}
+.ep-toggle{color:var(--muted);font-size:.8rem;margin-left:.5rem;transition:transform .2s}
+.ep-body{display:none;padding:0 1.2rem 1.2rem;border-top:1px solid var(--border)}
+.ep-body.open{display:block}
+
+/* PARAMS TABLE */
+.params-title{font-size:.72rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin:1rem 0 .5rem}
+table{width:100%;border-collapse:collapse;font-size:.83rem}
+th{text-align:left;color:var(--muted);font-weight:600;padding:.4rem .6rem;border-bottom:1px solid var(--border)}
+td{padding:.4rem .6rem;border-bottom:1px solid #1a1a1a;vertical-align:top}
+td:first-child{font-family:monospace;color:var(--code)}
+.req{color:var(--red);font-size:.7rem;font-weight:700}
+.opt{color:var(--muted);font-size:.7rem}
+
+/* CODE BLOCK */
+.code-block{background:#0d0d0d;border:1px solid var(--border);border-radius:8px;padding:1rem 1.2rem;margin-top:.75rem;font-family:monospace;font-size:.82rem;overflow-x:auto;position:relative;line-height:1.7}
+.code-label{font-size:.65rem;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin-bottom:.5rem}
+.key{color:#60a5fa}.str{color:#a5d6a7}.num{color:#ffb74d}.bool{color:#ce93d8}.null{color:#888}.punc{color:#888}
+
+/* RESPONSE BADGE */
+.res-200{background:#0d3b1f;color:#4ade80;font-size:.7rem;font-weight:700;padding:.15rem .5rem;border-radius:4px}
+
+/* AUTH NOTICE */
+.notice{background:#1a1400;border:1px solid #3d2e00;border-radius:10px;padding:1rem 1.2rem;font-size:.85rem;color:#fbbf24;margin-bottom:2rem}
+.notice strong{display:block;margin-bottom:.3rem}
+
+/* FOOTER */
+footer{border-top:1px solid var(--border);padding:2rem;text-align:center;color:var(--muted);font-size:.82rem}
+</style>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet"/>
+</head>
+<body>
+
+<nav>
+  <div class="nav-logo">
+    <svg width="28" height="28" viewBox="0 0 64 64" fill="none">
+      <rect width="64" height="64" rx="10" fill="#1a1a1a"/>
+      <rect x="9" y="9" width="7" height="5" rx="1.5" fill="#e50914"/>
+      <rect x="20" y="9" width="7" height="5" rx="1.5" fill="#e50914"/>
+      <rect x="37" y="9" width="7" height="5" rx="1.5" fill="#e50914"/>
+      <rect x="48" y="9" width="7" height="5" rx="1.5" fill="#e50914"/>
+      <rect x="9" y="50" width="7" height="5" rx="1.5" fill="#e50914"/>
+      <rect x="20" y="50" width="7" height="5" rx="1.5" fill="#e50914"/>
+      <rect x="37" y="50" width="7" height="5" rx="1.5" fill="#e50914"/>
+      <rect x="48" y="50" width="7" height="5" rx="1.5" fill="#e50914"/>
+      <path d="M38 22a12 12 0 1 0 0 20" stroke="#e50914" stroke-width="5" stroke-linecap="round" fill="none"/>
+    </svg>
+    Chege Movie API
+  </div>
+  <span class="badge-live">LIVE</span>
+  <div class="nav-links">
+    <a href="#movies">Movies</a>
+    <a href="#search">Search</a>
+    <a href="#stream">Stream</a>
+    <a href="#trending">Trending</a>
+    <a href="https://movieapi.nasotc.com/docs" target="_blank">Swagger UI ↗</a>
+  </div>
+</nav>
+
+<div class="hero">
+  <div class="hero-eyebrow">REST API · v3.0.0</div>
+  <h1>Chege Movie <span>API</span></h1>
+  <p>Live movie &amp; series data, stream sources, IMDB lookup, and embed servers. Powered by Chege.</p>
+  <div class="hero-base">
+    <span>https://movieapi.nasotc.com</span>
+    <button class="copy-btn" onclick="navigator.clipboard.writeText('https://movieapi.nasotc.com');this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)">Copy</button>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat"><div class="stat-num">30+</div><div class="stat-label">Endpoints</div></div>
+  <div class="stat"><div class="stat-num">1hr</div><div class="stat-label">Cache TTL</div></div>
+  <div class="stat"><div class="stat-num">4</div><div class="stat-label">Embed Servers</div></div>
+  <div class="stat"><div class="stat-num">100%</div><div class="stat-label">Free</div></div>
+</div>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-title">General</div>
+      <a href="#home">Home</a>
+      <a href="#health">Health</a>
+      <a href="#genres">Genres</a>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-title">Movies</div>
+      <a href="#movies">Browse</a>
+      <a href="#top-rated">Top Rated</a>
+      <a href="#new-releases">New Releases</a>
+      <a href="#featured">Featured</a>
+      <a href="#trending">Trending</a>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-title">Search</div>
+      <a href="#search">Search</a>
+      <a href="#suggest">Suggest</a>
+      <a href="#popular">Popular</a>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-title">Streaming</div>
+      <a href="#stream">Stream Info</a>
+      <a href="#play">Play (Combined)</a>
+      <a href="#servers">Embed Servers</a>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-title">Lookup</div>
+      <a href="#imdb">IMDB Lookup</a>
+      <a href="#similar">Similar</a>
+      <a href="#related">Related</a>
+    </div>
+  </aside>
+
+  <main class="content">
+
+    <div class="notice">
+      <strong>No authentication required</strong>
+      All endpoints are public. Base URL: <code>https://movieapi.nasotc.com</code>
+    </div>
+
+    <!-- GENERAL -->
+    <div class="section" id="home">
+      <div class="section-header">
+        <div class="section-icon" style="background:#1a0a0a">🏠</div>
+        <div><h2>General</h2><p>Home data, health check, genres</p></div>
+      </div>
+
+      <div class="ep-card">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/home</span>
+          <span class="ep-desc">Banner + platform sections</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <p style="color:var(--muted);font-size:.85rem">Returns the homepage banner items and curated operating sections.</p>
+          <div class="code-label">Example Response <span class="res-200">200</span></div>
+          <div class="code-block"><span class="punc">{</span>
+  <span class="key">"status"</span><span class="punc">:</span> <span class="num">200</span><span class="punc">,</span>
+  <span class="key">"results"</span><span class="punc">: {</span>
+    <span class="key">"banner"</span><span class="punc">: {</span> <span class="key">"items"</span><span class="punc">:</span> <span class="punc">[...]</span> <span class="punc">},</span>
+    <span class="key">"platformList"</span><span class="punc">:</span> <span class="punc">[...],</span>
+    <span class="key">"operatingList"</span><span class="punc">:</span> <span class="punc">[...]</span>
+  <span class="punc">}</span>
+<span class="punc">}</span></div>
+        </div>
+      </div>
+
+      <div class="ep-card" id="health">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/health</span>
+          <span class="ep-desc">Server health &amp; cache stats</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <div class="code-label">Example Response <span class="res-200">200</span></div>
+          <div class="code-block"><span class="punc">{</span>
+  <span class="key">"status"</span><span class="punc">:</span> <span class="str">"healthy"</span><span class="punc">,</span>
+  <span class="key">"version"</span><span class="punc">:</span> <span class="str">"3.0.0"</span><span class="punc">,</span>
+  <span class="key">"cache"</span><span class="punc">: {</span>
+    <span class="key">"movie_entries"</span><span class="punc">:</span> <span class="num">13</span><span class="punc">,</span>
+    <span class="key">"server_entries"</span><span class="punc">:</span> <span class="num">8</span>
+  <span class="punc">}</span>
+<span class="punc">}</span></div>
+        </div>
+      </div>
+
+      <div class="ep-card" id="genres">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/genres</span>
+          <span class="ep-desc">All available genres</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <div class="code-label">Example Response <span class="res-200">200</span></div>
+          <div class="code-block"><span class="punc">{</span>
+  <span class="key">"data"</span><span class="punc">: {</span>
+    <span class="key">"genres"</span><span class="punc">:</span> <span class="punc">[</span><span class="str">"Action"</span><span class="punc">,</span> <span class="str">"Comedy"</span><span class="punc">,</span> <span class="str">"Drama"</span><span class="punc">, ...]</span>
+  <span class="punc">}</span>
+<span class="punc">}</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- MOVIES -->
+    <div class="section" id="movies">
+      <div class="section-header">
+        <div class="section-icon" style="background:#0a1a0a">🎬</div>
+        <div><h2>Movies</h2><p>Browse, filter, and discover titles</p></div>
+      </div>
+
+      <div class="ep-card">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/movies</span>
+          <span class="ep-desc">Browse with filters</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <div class="params-title">Query Parameters</div>
+          <table>
+            <tr><th>Param</th><th>Type</th><th>Default</th><th>Description</th></tr>
+            <tr><td>page</td><td>int</td><td>1</td><td>Page number <span class="opt">optional</span></td></tr>
+            <tr><td>limit</td><td>int</td><td>20</td><td>Results per page (max 100) <span class="opt">optional</span></td></tr>
+            <tr><td>type</td><td>string</td><td>—</td><td><code>movie</code> or <code>series</code> <span class="opt">optional</span></td></tr>
+            <tr><td>genre</td><td>string</td><td>—</td><td>e.g. <code>Action</code>, <code>Drama</code> <span class="opt">optional</span></td></tr>
+            <tr><td>year</td><td>int</td><td>—</td><td>Release year <span class="opt">optional</span></td></tr>
+            <tr><td>country</td><td>string</td><td>—</td><td>Country name <span class="opt">optional</span></td></tr>
+          </table>
+          <div class="code-label">Example <span class="res-200">200</span></div>
+          <div class="code-block"><span class="punc">{</span>
+  <span class="key">"data"</span><span class="punc">: {</span>
+    <span class="key">"movies"</span><span class="punc">: [{</span>
+      <span class="key">"id"</span><span class="punc">:</span> <span class="str">"12345"</span><span class="punc">,</span>
+      <span class="key">"title"</span><span class="punc">:</span> <span class="str">"Inception"</span><span class="punc">,</span>
+      <span class="key">"type"</span><span class="punc">:</span> <span class="str">"movie"</span><span class="punc">,</span>
+      <span class="key">"year"</span><span class="punc">:</span> <span class="str">"2010"</span><span class="punc">,</span>
+      <span class="key">"imdb_rating"</span><span class="punc">:</span> <span class="str">"8.8"</span><span class="punc">,</span>
+      <span class="key">"poster_url"</span><span class="punc">:</span> <span class="str">"https://..."</span><span class="punc">,</span>
+      <span class="key">"detail_path"</span><span class="punc">:</span> <span class="str">"movie/inception-2010"</span>
+    <span class="punc">}],</span>
+    <span class="key">"total"</span><span class="punc">:</span> <span class="num">1200</span><span class="punc">,</span>
+    <span class="key">"has_more"</span><span class="punc">:</span> <span class="bool">true</span>
+  <span class="punc">}</span>
+<span class="punc">}</span></div>
+        </div>
+      </div>
+
+      <div class="ep-card" id="top-rated">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/movies/top-rated</span>
+          <span class="ep-desc">Sorted by IMDB score</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <div class="params-title">Query Parameters</div>
+          <table>
+            <tr><th>Param</th><th>Type</th><th>Default</th><th>Description</th></tr>
+            <tr><td>limit</td><td>int</td><td>20</td><td>Results <span class="opt">optional</span></td></tr>
+            <tr><td>type</td><td>string</td><td>—</td><td><code>movie</code> or <code>series</code> <span class="opt">optional</span></td></tr>
+            <tr><td>min_rating</td><td>float</td><td>7.5</td><td>Minimum IMDB rating <span class="opt">optional</span></td></tr>
+          </table>
+        </div>
+      </div>
+
+      <div class="ep-card" id="new-releases">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/movies/new-releases</span>
+          <span class="ep-desc">Latest titles by release date</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <div class="params-title">Query Parameters</div>
+          <table>
+            <tr><th>Param</th><th>Type</th><th>Default</th><th>Description</th></tr>
+            <tr><td>limit</td><td>int</td><td>20</td><td><span class="opt">optional</span></td></tr>
+            <tr><td>type</td><td>string</td><td>—</td><td><code>movie</code> or <code>series</code> <span class="opt">optional</span></td></tr>
+          </table>
+        </div>
+      </div>
+
+      <div class="ep-card" id="featured">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/movies/featured</span>
+          <span class="ep-desc">Daily curated mix</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <p style="color:var(--muted);font-size:.85rem">Returns a daily-shuffled mix of trending, top-rated, and new releases. Seed changes every 24 hours.</p>
+          <div class="params-title">Query Parameters</div>
+          <table>
+            <tr><th>Param</th><th>Type</th><th>Default</th></tr>
+            <tr><td>limit</td><td>int</td><td>20</td></tr>
+          </table>
+        </div>
+      </div>
+
+      <div class="ep-card">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/movies/similar/{detail_path}</span>
+          <span class="ep-desc">Genre-matched similar titles</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <div class="params-title">Path Parameters</div>
+          <table>
+            <tr><th>Param</th><th>Description</th></tr>
+            <tr><td>detail_path</td><td>The movie's detail_path from any listing <span class="req">required</span></td></tr>
+          </table>
+          <div class="params-title">Query Parameters</div>
+          <table>
+            <tr><th>Param</th><th>Default</th></tr>
+            <tr><td>limit</td><td>12</td></tr>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TRENDING -->
+    <div class="section" id="trending">
+      <div class="section-header">
+        <div class="section-icon" style="background:#0a0a1a">🔥</div>
+        <div><h2>Trending</h2><p>Hot right now</p></div>
+      </div>
+
+      <div class="ep-card">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/trending</span>
+          <span class="ep-desc">Currently trending titles</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <div class="params-title">Query Parameters</div>
+          <table>
+            <tr><th>Param</th><th>Default</th></tr>
+            <tr><td>page</td><td>1</td></tr>
+            <tr><td>limit</td><td>20</td></tr>
+          </table>
+        </div>
+      </div>
+
+      <div class="ep-card">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/recent</span>
+          <span class="ep-desc">Recently added titles</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <div class="params-title">Query Parameters</div>
+          <table>
+            <tr><th>Param</th><th>Default</th></tr>
+            <tr><td>page</td><td>1</td></tr>
+            <tr><td>limit</td><td>20</td></tr>
+          </table>
+        </div>
+      </div>
+
+      <div class="ep-card">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/ranking</span>
+          <span class="ep-desc">Platform ranking list</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <div class="params-title">Query Parameters</div>
+          <table>
+            <tr><th>Param</th><th>Default</th></tr>
+            <tr><td>id</td><td>""</td></tr>
+            <tr><td>page</td><td>1</td></tr>
+            <tr><td>limit</td><td>20</td></tr>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- SEARCH -->
+    <div class="section" id="search">
+      <div class="section-header">
+        <div class="section-icon" style="background:#0a1520">🔍</div>
+        <div><h2>Search</h2><p>Full-text and autocomplete</p></div>
+      </div>
+
+      <div class="ep-card">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/movies/search</span>
+          <span class="ep-desc">Full-text movie search</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <div class="params-title">Query Parameters</div>
+          <table>
+            <tr><th>Param</th><th>Type</th><th>Description</th></tr>
+            <tr><td>q</td><td>string</td><td>Search keyword <span class="req">required</span></td></tr>
+            <tr><td>page</td><td>int</td><td>Page number <span class="opt">optional</span></td></tr>
+            <tr><td>limit</td><td>int</td><td>Results per page <span class="opt">optional</span></td></tr>
+          </table>
+          <div class="code-label">Example</div>
+          <div class="code-block">GET /movies/search?q=batman&limit=20</div>
+        </div>
+      </div>
+
+      <div class="ep-card" id="suggest">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/movies/suggest</span>
+          <span class="ep-desc">Autocomplete suggestions</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <div class="params-title">Query Parameters</div>
+          <table>
+            <tr><th>Param</th><th>Description</th></tr>
+            <tr><td>q</td><td>Partial search keyword <span class="req">required</span></td></tr>
+          </table>
+          <div class="code-label">Example Response</div>
+          <div class="code-block"><span class="punc">{</span><span class="key">"data"</span><span class="punc">:</span> <span class="punc">{</span><span class="key">"suggestions"</span><span class="punc">:</span> <span class="punc">[</span><span class="str">"Batman Begins"</span><span class="punc">,</span> <span class="str">"Batman v Superman"</span><span class="punc">]}}</span></div>
+        </div>
+      </div>
+
+      <div class="ep-card" id="popular">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/popular-searches</span>
+          <span class="ep-desc">Trending search terms</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <div class="code-label">Example Response</div>
+          <div class="code-block"><span class="punc">{</span><span class="key">"data"</span><span class="punc">:</span> <span class="punc">{</span><span class="key">"searches"</span><span class="punc">:</span> <span class="punc">[</span><span class="str">"Avengers"</span><span class="punc">,</span> <span class="str">"Oppenheimer"</span><span class="punc">]}}</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- STREAM -->
+    <div class="section" id="stream">
+      <div class="section-header">
+        <div class="section-icon" style="background:#1a0a1a">▶️</div>
+        <div><h2>Streaming</h2><p>Stream info, players, and embed servers</p></div>
+      </div>
+
+      <div class="ep-card" id="play">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/play/{detail_path}</span>
+          <span class="ep-desc">Stream + servers (combined)</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <p style="color:var(--muted);font-size:.85rem;margin-bottom:.75rem">Recommended endpoint — returns stream metadata AND ranked embed servers in one request. Both halves are cached so repeat calls are instant.</p>
+          <div class="params-title">Path Parameters</div>
+          <table>
+            <tr><th>Param</th><th>Description</th></tr>
+            <tr><td>detail_path</td><td>Movie/series detail_path <span class="req">required</span></td></tr>
+          </table>
+          <div class="params-title">Query Parameters</div>
+          <table>
+            <tr><th>Param</th><th>Default</th><th>Description</th></tr>
+            <tr><td>ep</td><td>1</td><td>Episode number (series only)</td></tr>
+            <tr><td>season</td><td>1</td><td>Season number (series only)</td></tr>
+          </table>
+          <div class="code-label">Example Response <span class="res-200">200</span></div>
+          <div class="code-block"><span class="punc">{</span>
+  <span class="key">"data"</span><span class="punc">: {</span>
+    <span class="key">"stream"</span><span class="punc">: {</span>
+      <span class="key">"title"</span><span class="punc">:</span> <span class="str">"Inception"</span><span class="punc">,</span>
+      <span class="key">"imdb_id"</span><span class="punc">:</span> <span class="str">"tt1375666"</span><span class="punc">,</span>
+      <span class="key">"is_series"</span><span class="punc">:</span> <span class="bool">false</span><span class="punc">,</span>
+      <span class="key">"seasons"</span><span class="punc">:</span> <span class="punc">[],</span>
+      <span class="key">"trailer"</span><span class="punc">:</span> <span class="punc">{ </span><span class="key">"url"</span><span class="punc">:</span> <span class="str">"https://..."</span> <span class="punc">}</span>
+    <span class="punc">},</span>
+    <span class="key">"servers"</span><span class="punc">: {</span>
+      <span class="key">"working_count"</span><span class="punc">:</span> <span class="num">4</span><span class="punc">,</span>
+      <span class="key">"servers"</span><span class="punc">: [{</span>
+        <span class="key">"label"</span><span class="punc">:</span> <span class="str">"Server 1"</span><span class="punc">,</span>
+        <span class="key">"url"</span><span class="punc">:</span> <span class="str">"https://vidsrc.to/embed/movie/tt1375666"</span><span class="punc">,</span>
+        <span class="key">"ok"</span><span class="punc">:</span> <span class="bool">true</span><span class="punc">,</span>
+        <span class="key">"latency_ms"</span><span class="punc">:</span> <span class="num">312</span>
+      <span class="punc">}]</span>
+    <span class="punc">}</span>
+  <span class="punc">}</span>
+<span class="punc">}</span></div>
+        </div>
+      </div>
+
+      <div class="ep-card" id="servers">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/servers</span>
+          <span class="ep-desc">Ranked embed servers by IMDB ID</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <div class="params-title">Query Parameters</div>
+          <table>
+            <tr><th>Param</th><th>Type</th><th>Description</th></tr>
+            <tr><td>imdb_id</td><td>string</td><td>e.g. <code>tt1375666</code> <span class="req">required</span></td></tr>
+            <tr><td>type</td><td>string</td><td><code>movie</code> or <code>tv</code> <span class="req">required</span></td></tr>
+            <tr><td>season</td><td>int</td><td>Season (TV only) <span class="opt">optional</span></td></tr>
+            <tr><td>episode</td><td>int</td><td>Episode (TV only) <span class="opt">optional</span></td></tr>
+          </table>
+        </div>
+      </div>
+
+      <div class="ep-card">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/stream/{detail_path}</span>
+          <span class="ep-desc">Stream metadata only</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <p style="color:var(--muted);font-size:.85rem">Returns stream metadata without server probing. Use <code>/play/{detail_path}</code> for a combined response.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- IMDB -->
+    <div class="section" id="imdb">
+      <div class="section-header">
+        <div class="section-icon" style="background:#1a1400">⭐</div>
+        <div><h2>IMDB &amp; Related</h2><p>Lookup and recommendations</p></div>
+      </div>
+
+      <div class="ep-card">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/imdb/lookup</span>
+          <span class="ep-desc">Resolve title to IMDB ID</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <div class="params-title">Query Parameters</div>
+          <table>
+            <tr><th>Param</th><th>Type</th><th>Description</th></tr>
+            <tr><td>title</td><td>string</td><td>Movie/series title <span class="req">required</span></td></tr>
+            <tr><td>year</td><td>string</td><td>Release year <span class="opt">optional</span></td></tr>
+            <tr><td>type</td><td>string</td><td><code>movie</code>, <code>series</code>, <code>tv</code> <span class="opt">optional</span></td></tr>
+          </table>
+          <div class="code-label">Example</div>
+          <div class="code-block">GET /imdb/lookup?title=inception&year=2010&type=movie
+<span class="punc">{</span> <span class="key">"data"</span><span class="punc">:</span> <span class="punc">{</span> <span class="key">"imdb_id"</span><span class="punc">:</span> <span class="str">"tt1375666"</span> <span class="punc">}</span> <span class="punc">}</span></div>
+        </div>
+      </div>
+
+      <div class="ep-card" id="related">
+        <div class="ep-header" onclick="toggle(this)">
+          <span class="method GET">GET</span>
+          <span class="ep-path">/related/{subject_id}</span>
+          <span class="ep-desc">Platform-recommended related</span>
+          <span class="ep-toggle">▼</span>
+        </div>
+        <div class="ep-body">
+          <div class="params-title">Path Parameters</div>
+          <table>
+            <tr><th>Param</th><th>Description</th></tr>
+            <tr><td>subject_id</td><td>Subject ID from movie data <span class="req">required</span></td></tr>
+          </table>
+        </div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<footer>
+  Built by <strong style="color:#fff">Chege</strong> · Chege Movie API v3.0.0 ·
+  <a href="https://movieapi.nasotc.com/docs">Swagger UI</a> ·
+  <a href="https://movieapi.nasotc.com/redoc">ReDoc</a>
+</footer>
+
+<script>
+function toggle(header) {
+  const body = header.nextElementSibling;
+  const arrow = header.querySelector('.ep-toggle');
+  const isOpen = body.classList.contains('open');
+  body.classList.toggle('open', !isOpen);
+  arrow.style.transform = isOpen ? '' : 'rotate(180deg)';
+}
+// Highlight active sidebar link on scroll
+const sections = document.querySelectorAll('[id]');
+const links = document.querySelectorAll('.sidebar a');
+window.addEventListener('scroll', () => {
+  let current = '';
+  sections.forEach(s => { if (window.scrollY >= s.offsetTop - 120) current = s.id; });
+  links.forEach(a => {
+    a.classList.toggle('active', a.getAttribute('href') === '#' + current);
+  });
+});
+</script>
+</body>
+</html>

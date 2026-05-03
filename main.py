@@ -722,11 +722,13 @@ async def download_info(
         vkey = f"{subject_id}:{ep}:{season}:{resolution}"
         cached = _video_url_cache.get(vkey)
         if cached and time.time() - cached.get("ts", 0) < VIDEO_URL_TTL:
+            src_type = cached["type"]
             return {
                 "available": True,
                 "url": cached["url"],
-                "type": cached["type"],
-                "filename": f"{safe_title}_{resolution}p.{'m3u8' if cached['type'] == 'm3u8' else 'mp4'}",
+                "type": src_type,
+                "filename": f"{safe_title}_{resolution}p.mp4",
+                "needs_conversion": src_type == "m3u8",
                 "source": "cache",
             }
 
@@ -734,11 +736,13 @@ async def download_info(
     for u in stream.get("_found_video_urls") or []:
         if u.get("ep") == ep and (not season or u.get("season") == season):
             if abs(u.get("resolution", 0) - resolution) <= 360:
+                src_type = "m3u8" if ".m3u8" in u["url"] else "mp4"
                 return {
                     "available": True,
                     "url": u["url"],
-                    "type": "m3u8" if ".m3u8" in u["url"] else "mp4",
+                    "type": src_type,
                     "filename": f"{safe_title}_{u.get('resolution', resolution)}p.mp4",
+                    "needs_conversion": src_type == "m3u8",
                     "source": "resource",
                 }
 
@@ -748,11 +752,13 @@ async def download_info(
             subject_id, detail_path=detail_path, ep=ep, season=season, resolution=resolution
         )
         if nf_info:
+            src_type = nf_info["type"]
             return {
                 "available": True,
                 "url": nf_info["url"],
-                "type": nf_info["type"],
-                "filename": f"{safe_title}_{resolution}p.{'m3u8' if nf_info['type'] == 'm3u8' else 'mp4'}",
+                "type": src_type,
+                "filename": f"{safe_title}_{resolution}p.mp4",
+                "needs_conversion": src_type == "m3u8",
                 "source": "netfilm",
             }
 
@@ -765,6 +771,7 @@ async def download_info(
             "url": turl,
             "type": "mp4",
             "filename": f"{safe_title}_trailer.mp4",
+            "needs_conversion": False,
             "is_trailer": True,
             "source": "trailer",
         }
@@ -862,37 +869,67 @@ async def download_movie(
 
     video_url = video_info["url"]
     is_hls    = video_info.get("type") == "m3u8" or ".m3u8" in video_url
-
-    dl_headers = {
-        "Referer":    "https://moviebox.ac",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    }
+    filename  = f"{safe_title}_{resolution}p.mp4"
 
     if is_hls:
-        # Stream the m3u8 manifest — download managers (IDM, aria2c) can handle HLS
-        async def stream_hls():
-            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-                async with client.stream("GET", video_url, headers=dl_headers) as r:
-                    async for chunk in r.aiter_bytes(65536):
-                        yield chunk
+        # Convert HLS → MP4 on-the-fly via ffmpeg (stream remux, no re-encoding).
+        # -movflags frag_keyframe+empty_moov+faststart makes it a fragmented MP4
+        # so the browser starts receiving/showing progress immediately.
+        async def stream_hls_as_mp4():
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-headers",
+                "Referer: https://moviebox.ac\r\n"
+                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n",
+                "-i", video_url,
+                "-c", "copy",
+                "-f", "mp4",
+                "-movflags", "frag_keyframe+empty_moov+faststart",
+                "pipe:1",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                while True:
+                    chunk = await proc.stdout.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+
         return StreamingResponse(
-            stream_hls(),
-            media_type="application/x-mpegURL",
-            headers={"Content-Disposition": f'attachment; filename="{safe_title}.m3u8"',
-                     "Access-Control-Allow-Origin": "*"},
+            stream_hls_as_mp4(),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Access-Control-Allow-Origin": "*",
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
-    # Direct MP4 — stream through our server with range support
+    # Direct MP4 — proxy through our server
     async def stream_mp4():
+        dl_headers = {
+            "Referer":    "https://moviebox.ac",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
         async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
             async with client.stream("GET", video_url, headers=dl_headers) as r:
                 async for chunk in r.aiter_bytes(65536):
                     yield chunk
+
     return StreamingResponse(
         stream_mp4(),
         media_type="video/mp4",
-        headers={"Content-Disposition": f'attachment; filename="{safe_title}.mp4"',
-                 "Access-Control-Allow-Origin": "*"},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Access-Control-Allow-Origin": "*",
+        },
     )
 
 

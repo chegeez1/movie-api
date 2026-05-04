@@ -736,34 +736,37 @@ async def download_info(
                 "source": "bwm",
             }
 
+    def _resp(url: str, src_type: str, fname: str, **extra):
+        """Build a download-info response. HLS sources include stream_url for direct IDM use."""
+        is_hls = src_type == "m3u8" or ".m3u8" in url
+        r = {
+            "available": True,
+            "url": url,
+            "type": src_type,
+            "filename": fname,
+            "needs_conversion": is_hls,
+            **extra,
+        }
+        if is_hls:
+            r["stream_url"] = url   # raw m3u8 — IDM/VLC can grab this directly at full speed
+        return r
+
     # 2. Passive-capture cache (populated when anyone watches via the proxy player)
     if subject_id:
         vkey = f"{subject_id}:{ep}:{season}:{resolution}"
         cached = _video_url_cache.get(vkey)
         if cached and time.time() - cached.get("ts", 0) < VIDEO_URL_TTL:
-            src_type = cached["type"]
-            return {
-                "available": True,
-                "url": cached["url"],
-                "type": src_type,
-                "filename": f"{safe_title}_{resolution}p.mp4",
-                "needs_conversion": src_type == "m3u8",
-                "source": "cache",
-            }
+            return _resp(cached["url"], cached["type"],
+                         f"{safe_title}_{resolution}p.mp4", source="cache")
 
     # 3. Video URLs already extracted from the resource data (zero extra requests)
     for u in stream.get("_found_video_urls") or []:
         if u.get("ep") == ep and (not season or u.get("season") == season):
             if abs(u.get("resolution", 0) - resolution) <= 360:
                 src_type = "m3u8" if ".m3u8" in u["url"] else "mp4"
-                return {
-                    "available": True,
-                    "url": u["url"],
-                    "type": src_type,
-                    "filename": f"{safe_title}_{u.get('resolution', resolution)}p.mp4",
-                    "needs_conversion": src_type == "m3u8",
-                    "source": "resource",
-                }
+                return _resp(u["url"], src_type,
+                             f"{safe_title}_{u.get('resolution', resolution)}p.mp4",
+                             source="resource")
 
     # 4. Probe netfilm.world (player API + HTML parse)
     if subject_id:
@@ -771,29 +774,15 @@ async def download_info(
             subject_id, detail_path=detail_path, ep=ep, season=season, resolution=resolution
         )
         if nf_info:
-            src_type = nf_info["type"]
-            return {
-                "available": True,
-                "url": nf_info["url"],
-                "type": src_type,
-                "filename": f"{safe_title}_{resolution}p.mp4",
-                "needs_conversion": src_type == "m3u8",
-                "source": "netfilm",
-            }
+            return _resp(nf_info["url"], nf_info["type"],
+                         f"{safe_title}_{resolution}p.mp4", source="netfilm")
 
     # 5. Probe aoneroom video API endpoints directly
     if subject_id:
         ao_info = scraper.get_video_url(subject_id, ep=ep, season=season, resolution=resolution)
         if ao_info:
-            src_type = ao_info["type"]
-            return {
-                "available": True,
-                "url": ao_info["url"],
-                "type": src_type,
-                "filename": f"{safe_title}_{resolution}p.mp4",
-                "needs_conversion": src_type == "m3u8",
-                "source": "aoneroom",
-            }
+            return _resp(ao_info["url"], ao_info["type"],
+                         f"{safe_title}_{resolution}p.mp4", source="aoneroom")
 
     # 6. Trailer fallback
     trailer = stream.get("trailer") or {}

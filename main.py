@@ -875,7 +875,7 @@ async def download_movie(
     video_info = None
     dl_source  = "none"
 
-    # 0. BWM / GiftedTech — direct MP4 URLs, fastest path; redirect browser straight to CDN
+    # 0. BWM / GiftedTech — direct MP4 URLs; proxy through our server so mobile gets a real download
     if subject_id:
         bwm_sources = scraper.get_video_sources_bwm(
             subject_id, ep=ep, season=season, title=stream.get("title", safe_title)
@@ -883,12 +883,26 @@ async def download_movie(
         if bwm_sources:
             res_map = {"1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
             best = min(bwm_sources, key=lambda s: abs(res_map.get(s["quality"], 0) - resolution))
-            from fastapi.responses import RedirectResponse
             print(f"[download] source=bwm quality={best['quality']} url={best['url'][:100]}", file=sys.stderr)
-            return RedirectResponse(
-                url=best["url"],
-                status_code=302,
-                headers={"Content-Disposition": f'attachment; filename="{best["filename"]}"'},
+            bwm_url  = best["url"]
+            bwm_name = best["filename"]
+            async def stream_bwm():
+                dl_headers = {
+                    "Referer":    "https://moviebox.ac",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                }
+                async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                    async with client.stream("GET", bwm_url, headers=dl_headers) as r:
+                        async for chunk in r.aiter_bytes(65536):
+                            yield chunk
+            return StreamingResponse(
+                stream_bwm(),
+                media_type="application/octet-stream",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{bwm_name}"',
+                    "Access-Control-Allow-Origin": "*",
+                    "Cache-Control": "no-store",
+                },
             )
 
     # 1. Check the passive-capture cache (populated when anyone watches via the proxy player)
@@ -991,13 +1005,11 @@ async def download_movie(
 
         return StreamingResponse(
             stream_hls_as_mp4(),
-            media_type="video/mp4",
+            media_type="application/octet-stream",
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "Access-Control-Allow-Origin": "*",
-                "X-Content-Type-Options": "nosniff",
-                "Cache-Control": "no-store, no-cache, must-revalidate",
-                "Pragma": "no-cache",
+                "Cache-Control": "no-store",
             },
         )
 
@@ -1014,12 +1026,11 @@ async def download_movie(
 
     return StreamingResponse(
         stream_mp4(),
-        media_type="video/mp4",
+        media_type="application/octet-stream",
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
             "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "no-store, no-cache, must-revalidate",
-            "Pragma": "no-cache",
+            "Cache-Control": "no-store",
         },
     )
 

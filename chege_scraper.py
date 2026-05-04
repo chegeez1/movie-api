@@ -567,11 +567,21 @@ class ChegeScraper:
 
         safe = re.sub(r"[^a-zA-Z0-9_\-]", "_", title) if title else subject_id
         quality_order = {"1080p": 0, "720p": 1, "480p": 2, "360p": 3}
+
+        # Reject trailer/teaser/sample URLs — these are NOT the real movie
+        _TRAILER_SIGNALS = ("trailer", "teaser", "preview", "sample", "promo", "clip", "featurette")
+
         out = []
         for item in results:
             q = item.get("quality", "")
             dl_url = item.get("download_url", "") or item.get("stream_url", "")
             if not dl_url:
+                continue
+            url_lower = dl_url.lower()
+            label_lower = (item.get("label", "") or q).lower()
+            if any(sig in url_lower or sig in label_lower for sig in _TRAILER_SIGNALS):
+                import sys
+                print(f"[bwm-sources] skipping trailer URL: {dl_url[:80]}", file=sys.stderr)
                 continue
             out.append({
                 "quality": q,

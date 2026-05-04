@@ -484,7 +484,7 @@ class ChegeScraper:
                 matches = re.findall(pat, text, re.IGNORECASE)
                 for m in matches:
                     m = m.strip('"\'')
-                    if any(kw in m.lower() for kw in [".m3u8", ".mp4", "video", "stream", "cdn", "hls"]):
+                    if _is_video_url(m):
                         vtype = "m3u8" if ".m3u8" in m else "mp4"
                         print(f"[netfilm-html] Found {vtype} URL: {m[:80]}", file=sys.stderr)
                         return {"url": m, "type": vtype}

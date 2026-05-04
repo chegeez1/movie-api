@@ -504,14 +504,17 @@ def _embed_urls_for(imdb_id: str, is_series: bool, ep: int, season: int) -> list
 
 def _resolve_direct_source(stream: dict, ep: int, season: int, resolution: int) -> tuple[Optional[str], str]:
     """
-    Try fast/direct sources (no yt-dlp needed): passive_cache → BWM → aoneroom.
+    Try all direct sources (no embed page scraping needed):
+      passive_cache → BWM → netfilm.world → aoneroom API
     Returns (url, source_name) or (None, "").
+    netfilm.world is the same backend the /download/ endpoint uses successfully.
     """
     import sys
-    subject_id = stream.get("id", "")
-    title      = stream.get("title", "")
+    subject_id  = stream.get("id", "")
+    title       = stream.get("title", "")
+    detail_path = stream.get("detail_path", "")
 
-    # 1. Passive capture cache
+    # 1. Passive capture cache (someone already streamed this title)
     if subject_id:
         vkey = f"{subject_id}:{ep}:{season}:{resolution}"
         cached = _video_url_cache.get(vkey)
@@ -525,16 +528,34 @@ def _resolve_direct_source(stream: dict, ep: int, season: int, resolution: int) 
             if bwm:
                 res_map = {"1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
                 best = min(bwm, key=lambda s: abs(res_map.get(s["quality"], 0) - resolution))
-                return best["url"], f"bwm_{best['quality']}"
+                url = best["url"]
+                if _is_video_url(url):
+                    return url, f"bwm_{best['quality']}"
         except Exception as exc:
             print(f"[resolve] BWM: {exc}", file=sys.stderr)
 
-    # 3. Aoneroom API
+    # 3. netfilm.world — works via internal API + HTML scrape of the player page
+    if subject_id:
+        try:
+            nf = scraper.get_video_url_from_netfilm(
+                subject_id, detail_path=detail_path, ep=ep, season=season, resolution=resolution
+            )
+            if nf and _is_video_url(nf.get("url", "")):
+                print(f"[resolve] netfilm hit for {title!r}", file=sys.stderr)
+                return nf["url"], "netfilm"
+            elif nf:
+                print(f"[resolve] netfilm REJECTED URL: {nf.get('url','')[:80]}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[resolve] netfilm: {exc}", file=sys.stderr)
+
+    # 4. Aoneroom API
     if subject_id:
         try:
             ao = scraper.get_video_url(subject_id, ep=ep, season=season, resolution=resolution)
-            if ao and ao.get("url"):
+            if ao and _is_video_url(ao.get("url", "")):
                 return ao["url"], "aoneroom"
+            elif ao:
+                print(f"[resolve] aoneroom REJECTED URL: {ao.get('url','')[:80]}", file=sys.stderr)
         except Exception as exc:
             print(f"[resolve] aoneroom: {exc}", file=sys.stderr)
 

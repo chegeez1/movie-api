@@ -504,6 +504,113 @@ class ChegeScraper:
         except Exception as e:
             print(f"[netfilm-html] Error: {e}", file=sys.stderr)
 
+        # 3. Playwright fallback — headless Chromium renders the page, captures XHR responses
+        playwright_result = self._get_video_url_playwright(
+            subject_id, detail_path, ep=ep, season=season, resolution=resolution
+        )
+        if playwright_result:
+            return playwright_result
+
+        return None
+
+    def _get_video_url_playwright(
+        self,
+        subject_id: str,
+        detail_path: str,
+        ep: int = 1,
+        season: int = 0,
+        resolution: int = 1080,
+    ) -> Optional[Dict]:
+        """
+        Use Playwright headless Chromium to render the netfilm.world player and
+        capture the actual video URL from XHR/fetch responses. This is the most
+        reliable method since it runs real browser JavaScript.
+        Requires: pip install playwright --break-system-packages && playwright install chromium
+        """
+        import sys
+        try:
+            from playwright.sync_api import sync_playwright  # type: ignore
+        except ImportError:
+            print(
+                "[playwright] Not installed — run on VPS:\n"
+                "  pip install playwright --break-system-packages\n"
+                "  playwright install chromium",
+                file=sys.stderr,
+            )
+            return None
+
+        page_url = f"{PLAYER_URL}/movies/{detail_path}?id={subject_id}&ep={ep}&resolution={resolution}"
+        if season:
+            page_url += f"&se={season}"
+
+        print(f"[playwright] Rendering {page_url[:100]}", file=sys.stderr)
+        captured: list = []
+
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
+                )
+                ctx = browser.new_context(
+                    user_agent=HEADERS["User-Agent"],
+                    extra_http_headers={"Referer": PLAYER_URL + "/"},
+                )
+                page = ctx.new_page()
+
+                def on_response(response):
+                    try:
+                        url = response.url
+                        # Direct video URL in the request itself
+                        if _is_video_url(url) and url not in [c.get("url") for c in captured]:
+                            vtype = "m3u8" if ".m3u8" in url else "mp4"
+                            print(f"[playwright] Captured video URL from request: {url[:100]}", file=sys.stderr)
+                            captured.append({"url": url, "type": vtype})
+                            return
+                        # JSON API responses that may contain video URL
+                        ct = response.headers.get("content-type", "")
+                        if "application/json" in ct and response.status == 200:
+                            try:
+                                data = response.json()
+                                result = self._extract_video_url_from_json(data)
+                                if result and result["url"] not in [c.get("url") for c in captured]:
+                                    print(f"[playwright] Captured video URL from JSON ({url[:60]}): {result['url'][:80]}", file=sys.stderr)
+                                    captured.append(result)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                page.on("response", on_response)
+
+                try:
+                    page.goto(page_url, timeout=30_000, wait_until="domcontentloaded")
+                except Exception as nav_exc:
+                    print(f"[playwright] nav error (continuing): {nav_exc}", file=sys.stderr)
+
+                # Wait up to 15s for video URL to appear in network traffic
+                deadline = 15
+                waited = 0
+                while not captured and waited < deadline:
+                    page.wait_for_timeout(1000)
+                    waited += 1
+
+                browser.close()
+
+        except Exception as exc:
+            print(f"[playwright] Error: {exc}", file=sys.stderr)
+            return None
+
+        if captured:
+            # Prefer m3u8 (HLS) over mp4 for streaming, but any video URL is good
+            hls = [c for c in captured if c.get("type") == "m3u8"]
+            result = hls[0] if hls else captured[0]
+            print(f"[playwright] Using: {result['url'][:100]}", file=sys.stderr)
+            return result
+
+        print(f"[playwright] No video URL captured for {detail_path}", file=sys.stderr)
+        return None
+
         return None
 
     def _extract_video_url_from_json(self, data: Any) -> Optional[Dict]:

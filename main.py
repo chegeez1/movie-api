@@ -848,32 +848,59 @@ async def download_movie(
     safe_title = re.sub(r"[^a-zA-Z0-9_\-]", "_", stream.get("title", detail_path))
     subject_id  = stream.get("id", "")
 
+    import sys
+    from chege_scraper import _is_video_url
+
     video_info = None
+    dl_source  = "none"
 
     # 1. Check the passive-capture cache (populated when anyone watches via the proxy player)
     if subject_id:
         vkey = f"{subject_id}:{ep}:{season}:{resolution}"
         cached = _video_url_cache.get(vkey)
         if cached and time.time() - cached.get("ts", 0) < VIDEO_URL_TTL:
-            video_info = {"url": cached["url"], "type": cached["type"]}
+            curl = cached["url"]
+            if _is_video_url(curl):
+                video_info = {"url": curl, "type": cached["type"]}
+                dl_source  = "cache"
+            else:
+                print(f"[download] REJECTED cached URL (not video): {curl[:100]}", file=sys.stderr)
+                del _video_url_cache[vkey]   # evict the bad entry
 
     # 2. Probe netfilm.world directly (player API + HTML parsing)
     if not video_info and subject_id:
-        video_info = scraper.get_video_url_from_netfilm(
+        nf = scraper.get_video_url_from_netfilm(
             subject_id, detail_path=detail_path, ep=ep, season=season, resolution=resolution
         )
+        if nf and _is_video_url(nf.get("url", "")):
+            video_info = nf
+            dl_source  = "netfilm"
+        elif nf:
+            print(f"[download] REJECTED netfilm URL: {nf.get('url','')[:100]}", file=sys.stderr)
 
-    # 3. Try aoneroom API endpoints
+    # 3. Try aoneroom API endpoints directly
     if not video_info and subject_id:
-        video_info = scraper.get_video_url(subject_id, ep=ep, season=season, resolution=resolution)
+        ao = scraper.get_video_url(subject_id, ep=ep, season=season, resolution=resolution)
+        if ao and _is_video_url(ao.get("url", "")):
+            video_info = ao
+            dl_source  = "aoneroom"
+        elif ao:
+            print(f"[download] REJECTED aoneroom URL: {ao.get('url','')[:100]}", file=sys.stderr)
 
-    # 4. Fallback: trailer
+    # 4. Fallback: trailer (use raw CDN URL, not img-proxy wrapper)
     if not video_info:
         trailer = stream.get("trailer") or {}
-        turl = trailer.get("url")
-        if turl:
-            video_info  = {"url": turl, "type": "mp4"}
-            safe_title  = f"{safe_title}_trailer"
+        turl    = trailer.get("url", "")
+        # Unwrap img-proxy if needed (middleware rewrites CDN URLs; raw cache should have direct CDN)
+        if "/img?url=" in turl:
+            import urllib.parse as _up
+            turl = _up.unquote(turl.split("/img?url=", 1)[1].split("&")[0])
+        if turl and _is_video_url(turl):
+            video_info = {"url": turl, "type": "mp4"}
+            safe_title = f"{safe_title}_trailer"
+            dl_source  = "trailer"
+        elif turl:
+            print(f"[download] REJECTED trailer URL: {turl[:100]}", file=sys.stderr)
 
     if not video_info:
         raise HTTPException(
@@ -884,6 +911,7 @@ async def download_movie(
     video_url = video_info["url"]
     is_hls    = video_info.get("type") == "m3u8" or ".m3u8" in video_url
     filename  = f"{safe_title}_{resolution}p.mp4"
+    print(f"[download] source={dl_source} hls={is_hls} url={video_url[:100]}", file=sys.stderr)
 
     if is_hls:
         # Convert HLS → MP4 on-the-fly via ffmpeg (stream remux, no re-encoding).

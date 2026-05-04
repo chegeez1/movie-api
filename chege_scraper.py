@@ -531,6 +531,59 @@ class ChegeScraper:
                     return result
         return None
 
+    def get_video_sources_bwm(self, subject_id: str, ep: int = 1, season: int = 0, title: str = "") -> list:
+        """
+        Query zone.bwmxmd.co.ke's public Supabase function (GiftedTech backend) for
+        direct MP4 download URLs.  Returns a list of {quality, url, filename} dicts
+        sorted best-quality-first.  Returns [] if the upstream is unreachable or
+        returns no results.
+        """
+        import urllib.request as _req
+        BWM = "https://aubiomhswbxrxgfnoles.supabase.co/functions/v1/bwm-xmd"
+        endpoint = f"/sources/{subject_id}"
+        if season:
+            endpoint += f"?season={season}&episode={ep}"
+        else:
+            endpoint += f""  # movie — no season param
+        url = f"{BWM}?action=movie&endpoint={urllib.parse.quote(endpoint)}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 11; M2007J3SC) AppleWebKit/537.36",
+            "Origin": "https://zone.bwmxmd.co.ke",
+            "Referer": "https://zone.bwmxmd.co.ke/",
+            "Accept": "application/json",
+        }
+        try:
+            req = _req.Request(url, headers=headers)
+            with _req.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read())
+        except Exception as e:
+            import sys
+            print(f"[bwm-sources] fetch error: {e}", file=sys.stderr)
+            return []
+
+        results = data.get("results") or []
+        if not results:
+            return []
+
+        safe = re.sub(r"[^a-zA-Z0-9_\-]", "_", title) if title else subject_id
+        quality_order = {"1080p": 0, "720p": 1, "480p": 2, "360p": 3}
+        out = []
+        for item in results:
+            q = item.get("quality", "")
+            dl_url = item.get("download_url", "") or item.get("stream_url", "")
+            if not dl_url:
+                continue
+            out.append({
+                "quality": q,
+                "url": dl_url,
+                "filename": f"{safe}_{q}.mp4",
+                "_order": quality_order.get(q, 99),
+            })
+        out.sort(key=lambda x: x["_order"])
+        for item in out:
+            del item["_order"]
+        return out
+
     def get_video_url(self, subject_id: str, ep: int = 1, season: int = 0, resolution: int = 1080) -> Optional[Dict]:
         """Try to get the direct video/HLS URL from the aoneroom API (3s per attempt, fail fast)."""
         candidates = [

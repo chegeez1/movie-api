@@ -155,10 +155,14 @@ SERVER_CACHE_TTL = 600  # 10 minutes — probes are fast but network conditions 
 # key: "subjectId:ep:season:resolution"  value: {url, type, ts}
 _video_url_cache: dict = {}
 
-# ── VPS-disk download job queue ───────────────────────────────────────────────
+# ── VPS-disk download / local library ────────────────────────────────────────
 _DOWNLOAD_DIR = "/opt/movie-downloads"
 # job_id → {status, progress, filepath, filename, size_mb, error, ts}
 _download_jobs: dict = {}
+# Keys already auto-queued so we don't re-fire on every page refresh
+_auto_queued:   set  = set()
+# Limit concurrent background downloads so VPS isn't overwhelmed
+_dl_semaphore = threading.Semaphore(3)
 
 
 def _ensure_download_dir() -> None:
@@ -173,6 +177,108 @@ def _job_filepath(safe_title: str, ep: int, season: int, resolution: int):
     filename = f"{safe_title}_s{season:02d}e{ep:02d}_{resolution}p.mp4"
     filepath = os.path.join(_DOWNLOAD_DIR, filename)
     return filepath, filename
+
+
+def _find_local_file(safe_title: str, ep: int, season: int) -> Optional[str]:
+    """
+    Return path to the best matching local file for a title/ep/season,
+    or None. Prefers 1080p → 720p → any resolution.
+    """
+    if not os.path.isdir(_DOWNLOAD_DIR):
+        return None
+    prefix = f"{safe_title}_s{season:02d}e{ep:02d}_"
+    for res in ("1080p", "720p", "480p", "360p"):
+        candidate = os.path.join(_DOWNLOAD_DIR, f"{prefix}{res}.mp4")
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 50 * 1_048_576:
+            return candidate
+    # Fall back: any file with the prefix
+    try:
+        for fname in os.listdir(_DOWNLOAD_DIR):
+            if fname.startswith(prefix) and fname.endswith(".mp4"):
+                fpath = os.path.join(_DOWNLOAD_DIR, fname)
+                if os.path.getsize(fpath) > 50 * 1_048_576:
+                    return fpath
+    except OSError:
+        pass
+    return None
+
+
+def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 1080) -> None:
+    """
+    Background thread: resolves source URL and downloads to VPS disk.
+    Called automatically when a user views any movie/episode page.
+    """
+    import sys
+
+    safe_title = _safe_name(stream.get("title", "unknown"))[:60]
+    subject_id = stream.get("id", "")
+    imdb_id    = stream.get("imdb_id", "")
+    is_series  = stream.get("is_series", False)
+    title      = stream.get("title", safe_title)
+
+    filepath, filename = _job_filepath(safe_title, ep, season, resolution)
+
+    # Already on disk
+    if os.path.exists(filepath) and os.path.getsize(filepath) > 50 * 1_048_576:
+        print(f"[auto-dl] Already on disk: {filename}", file=sys.stderr)
+        return
+
+    # Check any resolution variant
+    if _find_local_file(safe_title, ep, season):
+        print(f"[auto-dl] Variant already on disk: {safe_title}", file=sys.stderr)
+        return
+
+    # Acquire semaphore — block until a slot is free
+    with _dl_semaphore:
+        # Re-check inside the lock
+        if _find_local_file(safe_title, ep, season):
+            return
+
+        source_url = None
+        is_embed   = False
+
+        # 1. Passive capture cache
+        if subject_id:
+            vkey   = f"{subject_id}:{ep}:{season}:{resolution}"
+            cached = _video_url_cache.get(vkey)
+            if cached and time.time() - cached.get("ts", 0) < VIDEO_URL_TTL:
+                source_url = cached["url"]
+                print(f"[auto-dl] Source: passive-cache — {filename}", file=sys.stderr)
+
+        # 2. BWM direct MP4
+        if not source_url and subject_id:
+            try:
+                bwm = scraper.get_video_sources_bwm(subject_id, ep=ep, season=season, title=title)
+                if bwm:
+                    res_map = {"1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
+                    best = min(bwm, key=lambda s: abs(res_map.get(s["quality"], 0) - resolution))
+                    source_url = best["url"]
+                    print(f"[auto-dl] Source: bwm ({best['quality']}) — {filename}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[auto-dl] BWM error: {exc}", file=sys.stderr)
+
+        # 3. vidsrc.to embed → yt-dlp extracts + downloads in one shot
+        if not source_url and imdb_id and imdb_id.startswith("tt"):
+            s = max(season, 1)
+            if is_series:
+                source_url = f"https://vidsrc.to/embed/tv/{imdb_id}/{s}/{ep}"
+            else:
+                source_url = f"https://vidsrc.to/embed/movie/{imdb_id}"
+            is_embed = True
+            print(f"[auto-dl] Source: vidsrc.to embed — {filename}", file=sys.stderr)
+
+        if not source_url:
+            print(f"[auto-dl] No source found for: {filename}", file=sys.stderr)
+            return
+
+        # Register as a proper job so /download-job/ can track it
+        job_id = f"auto_{safe_title}_{ep}_{season}_{resolution}"
+        _download_jobs[job_id] = {
+            "status": "queued", "progress": 0,
+            "filepath": filepath, "filename": filename,
+            "ts": time.time(), "auto": True,
+        }
+        _run_download_job(job_id, source_url, filepath, filename, is_embed)
 
 
 def _run_download_job(
@@ -715,12 +821,44 @@ async def popular_searches():
     return {"status": "success", "timestamp": now(), "data": {"searches": result}}
 
 
+def _trigger_auto_download(result: dict, ep: int = 1, season: int = 0) -> None:
+    """
+    Fire-and-forget: auto-download this title to VPS disk if not already present.
+    Key is (imdb_id or title, ep, season) — only queued once per server lifetime.
+    """
+    import sys
+    is_series = result.get("is_series", False)
+    # For series: queue the specific episode. For movies: ep=1, season=0.
+    _ep     = ep if is_series else 1
+    _season = season if is_series else 0
+    akey = f"{result.get('imdb_id') or result.get('id') or result.get('title', '')}:{_ep}:{_season}"
+    if akey in _auto_queued:
+        return
+    safe_title = _safe_name(result.get("title", "unknown"))[:60]
+    if _find_local_file(safe_title, _ep, _season):
+        _auto_queued.add(akey)
+        return
+    _auto_queued.add(akey)
+    print(f"[auto-dl] Queuing background download: {result.get('title')} s{_season}e{_ep}", file=sys.stderr)
+    threading.Thread(
+        target=_auto_download_worker,
+        args=(result, _ep, _season),
+        daemon=True,
+    ).start()
+
+
 @app.get("/stream/{detail_path:path}")
-async def get_stream(detail_path: str):
+async def get_stream(
+    detail_path: str,
+    ep: int = Query(1),
+    season: int = Query(0),
+):
     cache_key = f"stream:{detail_path}"
     result = _cached(cache_key, scraper.get_stream_info, detail_path=detail_path)
     if not result:
         raise HTTPException(status_code=404, detail="Stream info not found")
+    # Auto-download in background — non-blocking
+    _trigger_auto_download(result, ep=ep, season=season)
     return {"status": "success", "timestamp": now(), "data": result}
 
 
@@ -911,6 +1049,57 @@ async def download_file_by_job(job_id: str):
     )
 
 
+@app.get("/local-library")
+async def local_library():
+    """List all movies/episodes already downloaded to VPS disk."""
+    import sys
+    _ensure_download_dir()
+    files = []
+    try:
+        for fname in sorted(os.listdir(_DOWNLOAD_DIR)):
+            if not fname.endswith(".mp4"):
+                continue
+            fpath = os.path.join(_DOWNLOAD_DIR, fname)
+            try:
+                size = os.path.getsize(fpath)
+                mtime = os.path.getmtime(fpath)
+            except OSError:
+                continue
+            # Parse filename: {title}_s{season}e{ep}_{res}p.mp4
+            stem = fname[:-4]
+            title = stem
+            res = ""
+            ep_info = {}
+            # Extract resolution
+            if "_" in stem:
+                parts = stem.rsplit("_", 1)
+                if parts[1].endswith("p") and parts[1][:-1].isdigit():
+                    res = parts[1]
+                    stem = parts[0]
+            # Extract episode/season
+            import re as _re
+            m = _re.search(r"_s(\d+)e(\d+)$", stem)
+            if m:
+                ep_info = {"season": int(m.group(1)), "ep": int(m.group(2))}
+                title = stem[: m.start()].replace("_", " ").strip()
+            files.append({
+                "filename":  fname,
+                "title":     title,
+                "resolution": res,
+                "size_mb":   round(size / 1_048_576, 1),
+                "downloaded_at": mtime,
+                **ep_info,
+            })
+    except Exception as exc:
+        print(f"[local-library] Error: {exc}", file=sys.stderr)
+    return {
+        "status": "success",
+        "count": len(files),
+        "total_gb": round(sum(f["size_mb"] for f in files) / 1024, 2),
+        "files": files,
+    }
+
+
 @app.get("/download-info/{detail_path:path}")
 async def download_info(
     detail_path: str,
@@ -924,8 +1113,23 @@ async def download_info(
     if not stream:
         raise HTTPException(status_code=404, detail="Title not found")
 
-    safe_title = re.sub(r"[^a-zA-Z0-9_\-]", "_", stream.get("title", detail_path))
+    safe_title = _safe_name(stream.get("title", detail_path))[:60]
     subject_id = stream.get("id", "")
+
+    # 0. VPS local library — instant hit if already downloaded
+    local_path = _find_local_file(safe_title, ep, season)
+    if local_path:
+        fname = os.path.basename(local_path)
+        size_mb = os.path.getsize(local_path) // 1_048_576
+        return {
+            "available": True,
+            "source": "local",
+            "filename": fname,
+            "size_mb": size_mb,
+            "type": "mp4",
+            "needs_conversion": False,
+            "local": True,
+        }
 
     # 1. BWM / GiftedTech — direct MP4 URLs, multiple qualities, no conversion needed
     if subject_id:
@@ -1090,7 +1294,7 @@ async def download_movie(
     if not stream:
         raise HTTPException(status_code=404, detail="Title not found")
 
-    safe_title = re.sub(r"[^a-zA-Z0-9_\-]", "_", stream.get("title", detail_path))
+    safe_title = _safe_name(stream.get("title", detail_path))[:60]
     subject_id  = stream.get("id", "")
 
     import sys
@@ -1098,6 +1302,18 @@ async def download_movie(
 
     video_info = None
     dl_source  = "none"
+
+    # 0a. VPS local library — serve from disk if already downloaded (fastest)
+    local_path = _find_local_file(safe_title, ep, season)
+    if local_path:
+        local_name = os.path.basename(local_path)
+        print(f"[download] Serving from VPS disk: {local_path}", file=sys.stderr)
+        return FileResponse(
+            local_path,
+            media_type="application/octet-stream",
+            filename=local_name,
+            headers={"Content-Disposition": f'attachment; filename="{local_name}"'},
+        )
 
     # 0. BWM / GiftedTech — direct MP4 URLs; proxy through our server so mobile gets a real download
     if subject_id:

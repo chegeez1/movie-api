@@ -951,6 +951,8 @@ async def download_movie(
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "Access-Control-Allow-Origin": "*",
                 "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Pragma": "no-cache",
             },
         )
 
@@ -971,6 +973,8 @@ async def download_movie(
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
             "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
         },
     )
 

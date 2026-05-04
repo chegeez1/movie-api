@@ -762,7 +762,21 @@ async def download_info(
                 "source": "netfilm",
             }
 
-    # 4. Trailer fallback
+    # 4. Probe aoneroom video API endpoints directly
+    if subject_id:
+        ao_info = scraper.get_video_url(subject_id, ep=ep, season=season, resolution=resolution)
+        if ao_info:
+            src_type = ao_info["type"]
+            return {
+                "available": True,
+                "url": ao_info["url"],
+                "type": src_type,
+                "filename": f"{safe_title}_{resolution}p.mp4",
+                "needs_conversion": src_type == "m3u8",
+                "source": "aoneroom",
+            }
+
+    # 5. Trailer fallback
     trailer = stream.get("trailer") or {}
     turl = trailer.get("url")
     if turl:

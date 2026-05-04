@@ -779,7 +779,20 @@ async def download_info(
     # 5. Trailer fallback
     trailer = stream.get("trailer") or {}
     turl = trailer.get("url")
+    is_series = stream.get("is_series", False)
     if turl:
+        if is_series:
+            # For series, don't silently serve a trailer — tell user to watch first
+            return {
+                "available": True,
+                "url": turl,
+                "type": "mp4",
+                "filename": f"{safe_title}_trailer.mp4",
+                "needs_conversion": False,
+                "is_trailer": True,
+                "watch_first": True,
+                "source": "trailer",
+            }
         return {
             "available": True,
             "url": turl,

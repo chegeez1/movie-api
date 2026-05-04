@@ -9,10 +9,12 @@ from collections import deque
 from typing import Optional
 import asyncio
 import os
+import subprocess
 import threading
 import time
 import re
 import json
+import uuid
 import urllib.parse
 import httpx
 
@@ -152,6 +154,84 @@ SERVER_CACHE_TTL = 600  # 10 minutes — probes are fast but network conditions 
 # Video URL cache — populated automatically when users watch via the proxy player
 # key: "subjectId:ep:season:resolution"  value: {url, type, ts}
 _video_url_cache: dict = {}
+
+# ── VPS-disk download job queue ───────────────────────────────────────────────
+_DOWNLOAD_DIR = "/opt/movie-downloads"
+# job_id → {status, progress, filepath, filename, size_mb, error, ts}
+_download_jobs: dict = {}
+
+
+def _ensure_download_dir() -> None:
+    os.makedirs(_DOWNLOAD_DIR, exist_ok=True)
+
+
+def _safe_name(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_\-]", "_", text)
+
+
+def _job_filepath(safe_title: str, ep: int, season: int, resolution: int):
+    filename = f"{safe_title}_s{season:02d}e{ep:02d}_{resolution}p.mp4"
+    filepath = os.path.join(_DOWNLOAD_DIR, filename)
+    return filepath, filename
+
+
+def _run_download_job(
+    job_id: str,
+    source_url: str,
+    filepath: str,
+    filename: str,
+    is_embed: bool,
+) -> None:
+    """Background thread: downloads the video to VPS disk using yt-dlp."""
+    import sys
+
+    _download_jobs[job_id]["status"] = "downloading"
+    _ensure_download_dir()
+
+    cmd = [
+        "yt-dlp",
+        "--no-warnings",
+        "--no-check-certificate",
+        "--newline",
+        "--no-playlist",
+        "-o", filepath,
+        source_url,
+    ]
+    if not is_embed:
+        # For direct MP4/m3u8 we still want yt-dlp to handle merging/remux
+        cmd.insert(1, "--no-mtime")
+
+    print(f"[dl-job] {job_id} START — embed={is_embed} — {source_url[:80]}", file=sys.stderr)
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        for line in proc.stdout:  # type: ignore[union-attr]
+            line = line.strip()
+            if "[download]" in line and "%" in line:
+                try:
+                    pct = float(line.split("%")[0].strip().split()[-1])
+                    _download_jobs[job_id]["progress"] = round(min(pct, 99.9), 1)
+                except Exception:
+                    pass
+        proc.wait()
+
+        if proc.returncode == 0 and os.path.exists(filepath):
+            size = os.path.getsize(filepath)
+            print(f"[dl-job] {job_id} DONE — {size // 1_048_576} MB — {filepath}", file=sys.stderr)
+            _download_jobs[job_id].update(
+                {"status": "ready", "progress": 100, "size_mb": size // 1_048_576}
+            )
+        else:
+            print(f"[dl-job] {job_id} FAILED rc={proc.returncode}", file=sys.stderr)
+            _download_jobs[job_id].update({"status": "error", "error": "yt-dlp returned non-zero exit code"})
+    except FileNotFoundError:
+        _download_jobs[job_id].update({"status": "error", "error": "yt-dlp not installed on server"})
+    except Exception as exc:
+        print(f"[dl-job] {job_id} ERROR: {exc}", file=sys.stderr)
+        _download_jobs[job_id].update({"status": "error", "error": str(exc)})
+
+
 VIDEO_URL_TTL = 7200  # 2 hours
 
 
@@ -699,6 +779,136 @@ async def get_related(
         "data": {"related": result["items"], "page": page, "limit": limit,
                  "has_more": pager.get("hasMore", False)},
     }
+
+
+@app.post("/prepare-download/{detail_path:path}")
+async def prepare_download(
+    detail_path: str,
+    ep: int = Query(1),
+    season: int = Query(0),
+    resolution: int = Query(1080),
+):
+    """
+    Queue a VPS-disk download. Returns immediately with a job_id.
+    Client polls /download-job/{job_id} for progress, then GETs /download-file/{job_id}.
+    """
+    import sys
+
+    cache_key = f"stream:{detail_path}"
+    stream = _cached(cache_key, scraper.get_stream_info, detail_path=detail_path)
+    if not stream:
+        raise HTTPException(status_code=404, detail="Title not found")
+
+    safe_title  = _safe_name(stream.get("title", detail_path))[:60]
+    subject_id  = stream.get("id", "")
+    imdb_id     = stream.get("imdb_id", "")
+    is_series   = stream.get("is_series", False)
+    detail_path_escaped = stream.get("detail_path", detail_path)
+
+    filepath, filename = _job_filepath(safe_title, ep, season, resolution)
+
+    # ── Already on disk ───────────────────────────────────────────────────────
+    if os.path.exists(filepath) and os.path.getsize(filepath) > 50 * 1_048_576:
+        job_id = f"cached_{safe_title}_{ep}_{season}_{resolution}"
+        _download_jobs[job_id] = {
+            "status": "ready", "progress": 100,
+            "filepath": filepath, "filename": filename,
+            "size_mb": os.path.getsize(filepath) // 1_048_576,
+            "ts": time.time(),
+        }
+        print(f"[prepare-dl] Serving cached file: {filepath}", file=sys.stderr)
+        return {"job_id": job_id, "status": "ready", "cached": True}
+
+    # ── Active job for same file ──────────────────────────────────────────────
+    for jid, job in _download_jobs.items():
+        if job.get("filepath") == filepath and job["status"] in ("queued", "downloading"):
+            return {"job_id": jid, "status": job["status"]}
+
+    # ── Determine source URL ──────────────────────────────────────────────────
+    source_url = None
+    is_embed   = False
+
+    # 1. Passive capture cache (user already watched → URL is live)
+    if subject_id:
+        vkey   = f"{subject_id}:{ep}:{season}:{resolution}"
+        cached = _video_url_cache.get(vkey)
+        if cached and time.time() - cached.get("ts", 0) < VIDEO_URL_TTL:
+            source_url = cached["url"]
+            print(f"[prepare-dl] Source: passive-cache", file=sys.stderr)
+
+    # 2. BWM direct MP4
+    if not source_url and subject_id:
+        bwm = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: scraper.get_video_sources_bwm(
+                subject_id, ep=ep, season=season, title=stream.get("title", safe_title)
+            ),
+        )
+        if bwm:
+            res_map = {"1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
+            best = min(bwm, key=lambda s: abs(res_map.get(s["quality"], 0) - resolution))
+            source_url = best["url"]
+            print(f"[prepare-dl] Source: bwm ({best['quality']})", file=sys.stderr)
+
+    # 3. vidsrc.to embed — yt-dlp will extract + download in one shot
+    if not source_url and imdb_id and imdb_id.startswith("tt"):
+        s = max(season, 1)
+        if is_series:
+            source_url = f"https://vidsrc.to/embed/tv/{imdb_id}/{s}/{ep}"
+        else:
+            source_url = f"https://vidsrc.to/embed/movie/{imdb_id}"
+        is_embed = True
+        print(f"[prepare-dl] Source: vidsrc.to embed", file=sys.stderr)
+
+    if not source_url:
+        raise HTTPException(status_code=404, detail="No download source found for this title.")
+
+    # ── Start background download ─────────────────────────────────────────────
+    job_id = str(uuid.uuid4())[:8]
+    _download_jobs[job_id] = {
+        "status": "queued", "progress": 0,
+        "filepath": filepath, "filename": filename,
+        "ts": time.time(),
+    }
+    threading.Thread(
+        target=_run_download_job,
+        args=(job_id, source_url, filepath, filename, is_embed),
+        daemon=True,
+    ).start()
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/download-job/{job_id}")
+async def download_job_status(job_id: str):
+    """Poll this to track progress of a VPS-disk download job."""
+    job = _download_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "job_id":    job_id,
+        "status":    job["status"],
+        "progress":  round(job.get("progress", 0), 1),
+        "filename":  job.get("filename", ""),
+        "size_mb":   job.get("size_mb"),
+        "error":     job.get("error"),
+    }
+
+
+@app.get("/download-file/{job_id}")
+async def download_file_by_job(job_id: str):
+    """Serve a completed VPS-disk download directly to the browser."""
+    job = _download_jobs.get(job_id)
+    if not job or job["status"] != "ready":
+        raise HTTPException(status_code=404, detail="File not ready yet")
+    filepath = job["filepath"]
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="File missing from disk")
+    return FileResponse(
+        filepath,
+        media_type="application/octet-stream",
+        filename=job["filename"],
+        headers={"Content-Disposition": f'attachment; filename="{job["filename"]}"'},
+    )
 
 
 @app.get("/download-info/{detail_path:path}")

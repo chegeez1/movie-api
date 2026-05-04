@@ -1248,7 +1248,7 @@ async def proxy_player(request: Request, path: str = ""):
     # Browser-enforced: block all navigation and popups from the player frame
     if "text/html" in ct:
         resp_headers["content-security-policy"] = (
-            "navigate-to 'self' https://movieapi.nasotc.com https://movies.nasotc.com "
+            "navigate-to 'self' https://movieapi.jchege.tech https://movies.jchege.tech "
             "https://netfilm.world https://h5-api.aoneroom.com https://pbcdnw.aoneroom.com "
             "https://pbcdn.aoneroom.com; "
             "form-action 'self';"

@@ -886,6 +886,22 @@ async def download_movie(
     video_info = None
     dl_source  = "none"
 
+    # 0. BWM / GiftedTech — direct MP4 URLs, fastest path; redirect browser straight to CDN
+    if subject_id:
+        bwm_sources = scraper.get_video_sources_bwm(
+            subject_id, ep=ep, season=season, title=stream.get("title", safe_title)
+        )
+        if bwm_sources:
+            res_map = {"1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
+            best = min(bwm_sources, key=lambda s: abs(res_map.get(s["quality"], 0) - resolution))
+            from fastapi.responses import RedirectResponse
+            print(f"[download] source=bwm quality={best['quality']} url={best['url'][:100]}", file=sys.stderr)
+            return RedirectResponse(
+                url=best["url"],
+                status_code=302,
+                headers={"Content-Disposition": f'attachment; filename="{best["filename"]}"'},
+            )
+
     # 1. Check the passive-capture cache (populated when anyone watches via the proxy player)
     if subject_id:
         vkey = f"{subject_id}:{ep}:{season}:{resolution}"

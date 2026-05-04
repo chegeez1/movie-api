@@ -759,7 +759,21 @@ async def download_info(
             return _resp(cached["url"], cached["type"],
                          f"{safe_title}_{resolution}p.mp4", source="cache")
 
-    # 3. Video URLs already extracted from the resource data (zero extra requests)
+    # 3. yt-dlp → vidsrc.to (works for any title that streams on Server 1)
+    imdb_id  = stream.get("imdb_id", "")
+    is_series = stream.get("is_series", False)
+    if imdb_id:
+        ytdlp_info = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: scraper.get_video_url_from_ytdlp(
+                imdb_id, is_series, ep=ep, season=max(season, 1) if is_series else season
+            )
+        )
+        if ytdlp_info:
+            return _resp(ytdlp_info["url"], ytdlp_info["type"],
+                         f"{safe_title}_{resolution}p.mp4", source="ytdlp")
+
+    # 4. Video URLs already extracted from the resource data (zero extra requests)
     for u in stream.get("_found_video_urls") or []:
         if u.get("ep") == ep and (not season or u.get("season") == season):
             if abs(u.get("resolution", 0) - resolution) <= 360:
@@ -768,7 +782,7 @@ async def download_info(
                              f"{safe_title}_{u.get('resolution', resolution)}p.mp4",
                              source="resource")
 
-    # 4. Probe netfilm.world (player API + HTML parse)
+    # 5. Probe netfilm.world (player API + HTML parse)
     if subject_id:
         nf_info = scraper.get_video_url_from_netfilm(
             subject_id, detail_path=detail_path, ep=ep, season=season, resolution=resolution
@@ -918,7 +932,23 @@ async def download_movie(
                 print(f"[download] REJECTED cached URL (not video): {curl[:100]}", file=sys.stderr)
                 del _video_url_cache[vkey]   # evict the bad entry
 
-    # 2. Probe netfilm.world directly (player API + HTML parsing)
+    # 2. yt-dlp → vidsrc.to — works for any title that streams on Server 1
+    imdb_id   = stream.get("imdb_id", "")
+    is_series = stream.get("is_series", False)
+    if not video_info and imdb_id:
+        ytdlp_info = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: scraper.get_video_url_from_ytdlp(
+                imdb_id, is_series, ep=ep, season=max(season, 1) if is_series else season
+            )
+        )
+        if ytdlp_info and _is_video_url(ytdlp_info.get("url", "")):
+            video_info = ytdlp_info
+            dl_source  = "ytdlp"
+        elif ytdlp_info:
+            print(f"[download] REJECTED ytdlp URL: {ytdlp_info.get('url','')[:100]}", file=sys.stderr)
+
+    # 3. Probe netfilm.world directly (player API + HTML parsing)
     if not video_info and subject_id:
         nf = scraper.get_video_url_from_netfilm(
             subject_id, detail_path=detail_path, ep=ep, season=season, resolution=resolution
@@ -929,7 +959,7 @@ async def download_movie(
         elif nf:
             print(f"[download] REJECTED netfilm URL: {nf.get('url','')[:100]}", file=sys.stderr)
 
-    # 3. Try aoneroom API endpoints directly
+    # 4. Try aoneroom API endpoints directly
     if not video_info and subject_id:
         ao = scraper.get_video_url(subject_id, ep=ep, season=season, resolution=resolution)
         if ao and _is_video_url(ao.get("url", "")):

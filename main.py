@@ -505,14 +505,30 @@ def _embed_urls_for(imdb_id: str, is_series: bool, ep: int, season: int) -> list
 def _resolve_direct_source(stream: dict, ep: int, season: int, resolution: int) -> tuple[Optional[str], str]:
     """
     Try all direct sources (no embed page scraping needed):
-      passive_cache → BWM → netfilm.world → aoneroom API
+      found_video_urls → passive_cache → BWM → aoneroom API → netfilm.world
     Returns (url, source_name) or (None, "").
-    netfilm.world is the same backend the /download/ endpoint uses successfully.
+
+    _found_video_urls: direct CDN URLs already embedded in stream metadata — completely free.
     """
     import sys
     subject_id  = stream.get("id", "")
     title       = stream.get("title", "")
     detail_path = stream.get("detail_path", "")
+
+    # 0. Direct CDN URLs already in the stream info response (aoneroom CDN — best source)
+    found = stream.get("_found_video_urls", [])
+    if found:
+        # Find best match for this ep/season, then fall back to any URL
+        matches = [u for u in found if u.get("ep") == ep and u.get("season") == season]
+        if not matches:
+            matches = found  # take any URL from the title
+        if matches:
+            # Pick closest resolution
+            best = min(matches, key=lambda u: abs(u.get("resolution", 0) - resolution))
+            url = best.get("url", "")
+            if _is_video_url(url):
+                print(f"[resolve] found_video_url hit for {title!r}: {url[:80]}", file=sys.stderr)
+                return url, "stream_meta"
 
     # 1. Passive capture cache (someone already streamed this title)
     if subject_id:
@@ -534,7 +550,18 @@ def _resolve_direct_source(stream: dict, ep: int, season: int, resolution: int) 
         except Exception as exc:
             print(f"[resolve] BWM: {exc}", file=sys.stderr)
 
-    # 3. netfilm.world — works via internal API + HTML scrape of the player page
+    # 3. Aoneroom API (direct endpoints)
+    if subject_id:
+        try:
+            ao = scraper.get_video_url(subject_id, ep=ep, season=season, resolution=resolution)
+            if ao and _is_video_url(ao.get("url", "")):
+                return ao["url"], "aoneroom"
+            elif ao:
+                print(f"[resolve] aoneroom REJECTED URL: {ao.get('url','')[:80]}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[resolve] aoneroom: {exc}", file=sys.stderr)
+
+    # 4. netfilm.world — internal API + HTML scrape of the player page
     if subject_id:
         try:
             nf = scraper.get_video_url_from_netfilm(
@@ -547,17 +574,6 @@ def _resolve_direct_source(stream: dict, ep: int, season: int, resolution: int) 
                 print(f"[resolve] netfilm REJECTED URL: {nf.get('url','')[:80]}", file=sys.stderr)
         except Exception as exc:
             print(f"[resolve] netfilm: {exc}", file=sys.stderr)
-
-    # 4. Aoneroom API
-    if subject_id:
-        try:
-            ao = scraper.get_video_url(subject_id, ep=ep, season=season, resolution=resolution)
-            if ao and _is_video_url(ao.get("url", "")):
-                return ao["url"], "aoneroom"
-            elif ao:
-                print(f"[resolve] aoneroom REJECTED URL: {ao.get('url','')[:80]}", file=sys.stderr)
-        except Exception as exc:
-            print(f"[resolve] aoneroom: {exc}", file=sys.stderr)
 
     return None, ""
 

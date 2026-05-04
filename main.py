@@ -161,12 +161,136 @@ _DOWNLOAD_DIR = "/opt/movie-downloads"
 _download_jobs: dict = {}
 # Keys already auto-queued so we don't re-fire on every page refresh
 _auto_queued:   set  = set()
-# Limit concurrent background downloads so VPS isn't overwhelmed
+# Limit concurrent background downloads — 3 parallel max
 _dl_semaphore = threading.Semaphore(3)
+
+# ── Bulk library builder state ────────────────────────────────────────────────
+_bulk_active  = False          # True while bulk builder is running
+_bulk_stop    = False          # Set to True to request graceful stop
+_bulk_stats: dict = {
+    "seen": 0, "queued": 0, "skipped": 0, "errors": 0,
+    "page": 0, "source": "", "started_at": None, "finished_at": None,
+}
 
 
 def _ensure_download_dir() -> None:
     os.makedirs(_DOWNLOAD_DIR, exist_ok=True)
+
+
+def _bulk_process_item(item: dict) -> None:
+    """Try to queue a download for a single scraped item (movie or episode 1 of series)."""
+    global _bulk_stats
+    import sys
+
+    detail_path = item.get("detail_path") or item.get("detailPath", "")
+    if not detail_path:
+        _bulk_stats["skipped"] += 1
+        return
+
+    _bulk_stats["seen"] += 1
+
+    try:
+        stream = _cached(
+            f"stream:{detail_path}",
+            scraper.get_stream_info,
+            detail_path=detail_path,
+        )
+        if not stream:
+            _bulk_stats["errors"] += 1
+            return
+    except Exception as exc:
+        print(f"[bulk-dl] stream_info error — {detail_path}: {exc}", file=sys.stderr)
+        _bulk_stats["errors"] += 1
+        return
+
+    safe_title = _safe_name(stream.get("title", "unknown"))[:60]
+    is_series  = stream.get("is_series", False)
+    ep, season = (1, 1) if is_series else (1, 0)
+
+    if _find_local_file(safe_title, ep, season):
+        _bulk_stats["skipped"] += 1
+        return
+
+    _trigger_auto_download(stream, ep=ep, season=season)
+    _bulk_stats["queued"] += 1
+
+
+def _bulk_download_all(
+    max_pages: int = 200,
+    include_series: bool = True,
+    concurrency: int = 3,
+) -> None:
+    """
+    Background thread — scrapes ALL content from MovieBox and downloads everything to VPS disk.
+    Sources iterated in order:
+      1. All movies via subject/filter (paginated, subject_type=1)
+      2. All series via subject/filter (paginated, subject_type=2)  [if include_series]
+      3. Ranking chart (multiple pages)
+      4. Trending (multiple pages)
+    Each item calls _trigger_auto_download() which fires its own daemon thread.
+    The _dl_semaphore limits parallel yt-dlp processes to `concurrency`.
+    """
+    global _bulk_active, _bulk_stop, _bulk_stats, _dl_semaphore
+    import sys
+
+    _dl_semaphore = threading.Semaphore(concurrency)
+    _bulk_active  = True
+    _bulk_stop    = False
+    _bulk_stats.update({
+        "seen": 0, "queued": 0, "skipped": 0, "errors": 0,
+        "page": 0, "source": "", "started_at": time.time(), "finished_at": None,
+    })
+
+    print(f"[bulk-dl] Starting — max_pages={max_pages} series={include_series} concurrency={concurrency}", file=sys.stderr)
+
+    def _scrape_pages(source_name: str, fetch_fn, *args, **kwargs):
+        """Iterate pages from a paginated scraper fn until exhausted or stopped."""
+        for page in range(1, max_pages + 1):
+            if _bulk_stop:
+                return
+            _bulk_stats["page"]   = page
+            _bulk_stats["source"] = source_name
+            try:
+                result = fetch_fn(*args, page=page, per_page=30, **kwargs)
+            except Exception as exc:
+                print(f"[bulk-dl] {source_name} page {page} error: {exc}", file=sys.stderr)
+                break
+            items = result.get("items", [])
+            if not items:
+                break
+            for item in items:
+                if _bulk_stop:
+                    return
+                if not include_series and item.get("is_series"):
+                    _bulk_stats["skipped"] += 1
+                    continue
+                _bulk_process_item(item)
+                time.sleep(0.4)   # gentle throttle — don't hammer the origin
+            if not result.get("pager", {}).get("hasMore", False):
+                print(f"[bulk-dl] {source_name} exhausted at page {page}", file=sys.stderr)
+                break
+            time.sleep(1.5)   # pause between pages
+
+    try:
+        # ── 1. All movies ────────────────────────────────────────────────────
+        _scrape_pages("movies", scraper.get_movies, subject_type=1)
+
+        # ── 2. All series (ep 1 s1 only) ────────────────────────────────────
+        if include_series and not _bulk_stop:
+            _scrape_pages("series", scraper.get_movies, subject_type=2)
+
+        # ── 3. Ranking chart (catches popular titles the filter might miss) ──
+        if not _bulk_stop:
+            _scrape_pages("ranking", scraper.get_ranking)
+
+        # ── 4. Trending ──────────────────────────────────────────────────────
+        if not _bulk_stop:
+            _scrape_pages("trending", scraper.get_trending)
+
+    finally:
+        _bulk_stats["finished_at"] = time.time()
+        _bulk_active = False
+        print(f"[bulk-dl] Finished — {_bulk_stats}", file=sys.stderr)
 
 
 def _safe_name(text: str) -> str:
@@ -1047,6 +1171,88 @@ async def download_file_by_job(job_id: str):
         filename=job["filename"],
         headers={"Content-Disposition": f'attachment; filename="{job["filename"]}"'},
     )
+
+
+@app.post("/build-library")
+async def start_build_library(
+    max_pages: int   = Query(500,  description="Max pages to scrape per source"),
+    series:    bool  = Query(True, description="Also download series (ep1 s1)"),
+    concurrency: int = Query(3,    description="Parallel yt-dlp downloads"),
+):
+    """Start the bulk MovieBox → VPS downloader in the background."""
+    global _bulk_active, _bulk_stop
+    if _bulk_active:
+        return {"status": "already_running", "stats": _bulk_stats}
+    _bulk_stop = False
+    threading.Thread(
+        target=_bulk_download_all,
+        args=(max_pages, series, concurrency),
+        daemon=True,
+    ).start()
+    return {"status": "started", "max_pages": max_pages, "series": series, "concurrency": concurrency}
+
+
+@app.delete("/build-library")
+async def stop_build_library():
+    """Gracefully stop the bulk downloader (active yt-dlp jobs finish, no new ones start)."""
+    global _bulk_stop
+    _bulk_stop = True
+    return {"status": "stopping", "stats": _bulk_stats}
+
+
+@app.get("/library-status")
+async def library_status():
+    """Overall stats: disk library + active downloads + bulk builder progress."""
+    _ensure_download_dir()
+
+    # Count files on disk
+    total_files  = 0
+    total_bytes  = 0
+    if os.path.isdir(_DOWNLOAD_DIR):
+        for fname in os.listdir(_DOWNLOAD_DIR):
+            if fname.endswith(".mp4"):
+                fpath = os.path.join(_DOWNLOAD_DIR, fname)
+                try:
+                    total_bytes += os.path.getsize(fpath)
+                    total_files += 1
+                except OSError:
+                    pass
+
+    # Snapshot active / queued jobs
+    active_jobs = [
+        {
+            "job_id":   jid,
+            "status":   job["status"],
+            "progress": job.get("progress", 0),
+            "filename": job.get("filename", ""),
+            "auto":     job.get("auto", False),
+        }
+        for jid, job in list(_download_jobs.items())
+        if job["status"] in ("queued", "downloading")
+    ]
+
+    elapsed = None
+    if _bulk_stats.get("started_at"):
+        end = _bulk_stats.get("finished_at") or time.time()
+        elapsed = round(end - _bulk_stats["started_at"])
+
+    return {
+        "library": {
+            "total_files": total_files,
+            "total_gb":    round(total_bytes / 1_073_741_824, 2),
+            "path":        _DOWNLOAD_DIR,
+        },
+        "bulk_builder": {
+            "active":       _bulk_active,
+            "stop_requested": _bulk_stop,
+            "elapsed_sec":  elapsed,
+            "stats":        _bulk_stats,
+        },
+        "active_downloads":   active_jobs,
+        "queued_count":       sum(1 for j in _download_jobs.values() if j["status"] == "queued"),
+        "downloading_count":  sum(1 for j in _download_jobs.values() if j["status"] == "downloading"),
+        "completed_count":    sum(1 for j in _download_jobs.values() if j["status"] == "ready"),
+    }
 
 
 @app.get("/local-library")

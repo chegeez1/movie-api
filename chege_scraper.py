@@ -8,6 +8,41 @@ UPSTREAM_API = "https://h5-api.aoneroom.com"
 SITE_URL = "https://moviebox.ac"
 PLAYER_URL = "https://netfilm.world"
 
+# Known video CDN domains — URLs from these are always valid video sources
+_VIDEO_CDN_DOMAINS = (
+    "pbcdnw.aoneroom.com",
+    "pbcdn.aoneroom.com",
+    "macdn.aoneroom.com",
+    "cdn.aoneroom.com",
+)
+
+# File extensions that are definitely NOT video files
+_NON_VIDEO_EXTS = (
+    ".js", ".css", ".html", ".json", ".png", ".jpg", ".jpeg",
+    ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".map",
+    ".xml", ".txt", ".pdf", ".zip",
+)
+
+
+def _is_video_url(url: str) -> bool:
+    """Return True only if the URL looks like an actual video stream or file."""
+    if not isinstance(url, str) or not url.startswith("http"):
+        return False
+    low = url.lower().split("?")[0]  # strip query string for ext check
+    # Reject known non-video extensions
+    if any(low.endswith(ext) for ext in _NON_VIDEO_EXTS):
+        return False
+    # Accept if it has a clear video signal
+    if ".m3u8" in low or ".mp4" in low or ".ts" in low or ".webm" in low:
+        return True
+    # Accept if it comes from a known video CDN
+    if any(cdn in url for cdn in _VIDEO_CDN_DOMAINS):
+        return True
+    # Accept if path contains video-related keywords (but not JS/CSS paths)
+    if any(kw in low for kw in ["video", "stream", "hls", "play", "media"]):
+        return True
+    return False
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Referer": SITE_URL,
@@ -319,7 +354,7 @@ class ChegeScraper:
             for r in resolutions:
                 for key in ("url", "videoUrl", "playUrl", "hlsUrl", "m3u8Url", "address"):
                     val = r.get(key)
-                    if isinstance(val, str) and val.startswith("http"):
+                    if _is_video_url(val):
                         _found_video_urls.append({
                             "url": val,
                             "resolution": r.get("resolution", 0),
@@ -329,7 +364,7 @@ class ChegeScraper:
                 addr = r.get("videoAddress") or r.get("address") or {}
                 if isinstance(addr, dict):
                     val = addr.get("url") or addr.get("address")
-                    if isinstance(val, str) and val.startswith("http"):
+                    if _is_video_url(val):
                         _found_video_urls.append({
                             "url": val,
                             "resolution": r.get("resolution", 0),
@@ -474,17 +509,16 @@ class ChegeScraper:
     def _extract_video_url_from_json(self, data: Any) -> Optional[Dict]:
         """Recursively search a JSON structure for a video URL."""
         if isinstance(data, str):
-            if data.startswith("http") and (".m3u8" in data or ".mp4" in data):
+            if _is_video_url(data):
                 return {"url": data, "type": "m3u8" if ".m3u8" in data else "mp4"}
             return None
         if isinstance(data, dict):
-            # Direct URL fields
+            # Direct URL fields — validated through _is_video_url
             for key in ("url", "videoUrl", "playUrl", "hlsUrl", "m3u8Url", "source",
                         "address", "videoAddress", "streamUrl", "mediaUrl", "fileUrl"):
                 val = data.get(key)
-                if isinstance(val, str) and val.startswith("http"):
-                    if any(kw in val for kw in [".m3u8", ".mp4", "video", "stream", "cdn", "hls"]):
-                        return {"url": val, "type": "m3u8" if ".m3u8" in val else "mp4"}
+                if _is_video_url(val):
+                    return {"url": val, "type": "m3u8" if ".m3u8" in val else "mp4"}
             # Recurse into nested dicts/lists
             for v in data.values():
                 result = self._extract_video_url_from_json(v)
@@ -514,17 +548,17 @@ class ChegeScraper:
             if not data:
                 continue
             inner = data.get("data", {})
-            # Flat URL fields
+            # Flat URL fields — validated through _is_video_url
             for key in ("url", "videoUrl", "playUrl", "hlsUrl", "m3u8Url", "source", "address", "videoAddress"):
                 val = inner.get(key)
-                if isinstance(val, str) and val.startswith("http"):
+                if _is_video_url(val):
                     return {"url": val, "type": "m3u8" if ".m3u8" in val else "mp4", "endpoint": path}
             # Nested address objects
             for key in ("videoAddress", "address", "playInfo"):
                 obj = inner.get(key)
                 if isinstance(obj, dict):
                     val = obj.get("url") or obj.get("address")
-                    if isinstance(val, str) and val.startswith("http"):
+                    if _is_video_url(val):
                         return {"url": val, "type": "m3u8" if ".m3u8" in val else "mp4", "endpoint": path}
             # Log what we got back so we can tune the endpoint discovery
             import sys

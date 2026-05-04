@@ -654,6 +654,71 @@ class ChegeScraper:
             print(f"[download-probe] {path} -> keys={list(inner.keys())}", file=sys.stderr)
         return None
 
+    def get_video_url_from_ytdlp(
+        self,
+        imdb_id: str,
+        is_series: bool,
+        ep: int = 1,
+        season: int = 1,
+    ) -> Optional[Dict]:
+        """
+        Use yt-dlp to extract the direct video/HLS URL from vidsrc.to.
+        Returns {"url": ..., "type": "m3u8"|"mp4"} or None.
+        yt-dlp must be installed on the server: pip install -U yt-dlp
+        """
+        import subprocess, sys
+
+        if not imdb_id or not imdb_id.startswith("tt"):
+            return None
+
+        if is_series:
+            s = max(season, 1)
+            embed_url = f"https://vidsrc.to/embed/tv/{imdb_id}/{s}/{ep}"
+        else:
+            embed_url = f"https://vidsrc.to/embed/movie/{imdb_id}"
+
+        print(f"[ytdlp] Trying: {embed_url}", file=sys.stderr)
+        try:
+            result = subprocess.run(
+                [
+                    "yt-dlp",
+                    "--no-playlist",
+                    "--get-url",
+                    "--no-warnings",
+                    "--no-check-certificate",
+                    "--quiet",
+                    embed_url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+            raw = result.stdout.strip()
+            if result.returncode != 0 or not raw:
+                err = result.stderr.strip()[:200]
+                print(f"[ytdlp] Failed (rc={result.returncode}): {err}", file=sys.stderr)
+                return None
+
+            # yt-dlp may return multiple URLs (audio+video) — take the first video one
+            for line in raw.splitlines():
+                line = line.strip()
+                if _is_video_url(line):
+                    vtype = "m3u8" if ".m3u8" in line else "mp4"
+                    print(f"[ytdlp] Got {vtype}: {line[:100]}", file=sys.stderr)
+                    return {"url": line, "type": vtype}
+
+            print(f"[ytdlp] Output not a video URL: {raw[:200]}", file=sys.stderr)
+            return None
+        except FileNotFoundError:
+            print("[ytdlp] yt-dlp not installed — run: pip install -U yt-dlp", file=sys.stderr)
+            return None
+        except subprocess.TimeoutExpired:
+            print("[ytdlp] Timed out after 45s", file=sys.stderr)
+            return None
+        except Exception as e:
+            print(f"[ytdlp] Error: {e}", file=sys.stderr)
+            return None
+
     def get_related(self, subject_id: str, page: int = 1, per_page: int = 12) -> Dict:
         data = self._get(
             "/wefeed-h5api-bff/subject/detail-rec",

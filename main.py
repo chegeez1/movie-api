@@ -327,82 +327,77 @@ def _find_local_file(safe_title: str, ep: int, season: int) -> Optional[str]:
     return None
 
 
-def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 1080) -> None:
+def _download_direct_mp4(job_id: str, url: str, filepath: str, headers: Optional[dict] = None) -> bool:
     """
-    Background thread: resolves source URL and downloads to VPS disk.
-    Called automatically when a user views any movie/episode page.
+    Download a direct MP4/video URL to disk using wget (fast, reliable, resumes).
+    Returns True on success.
     """
     import sys
+    _ensure_download_dir()
+    hdrs = headers or {}
+    cmd = [
+        "wget", "-q", "--show-progress", "--progress=dot:giga",
+        "-c",          # resume partial downloads
+        "--timeout=30", "--tries=3",
+        "-O", filepath,
+    ]
+    for k, v in hdrs.items():
+        cmd += ["--header", f"{k}: {v}"]
+    cmd.append(url)
 
-    safe_title = _safe_name(stream.get("title", "unknown"))[:60]
-    subject_id = stream.get("id", "")
-    imdb_id    = stream.get("imdb_id", "")
-    is_series  = stream.get("is_series", False)
-    title      = stream.get("title", safe_title)
+    print(f"[dl-job] {job_id} wget {url[:80]}", file=sys.stderr)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:  # type: ignore[union-attr]
+            pass   # just drain — wget progress goes to stderr which we merged
+        proc.wait()
+        if proc.returncode == 0 and os.path.exists(filepath) and os.path.getsize(filepath) > 1_048_576:
+            return True
+        print(f"[dl-job] {job_id} wget rc={proc.returncode}", file=sys.stderr)
+        return False
+    except FileNotFoundError:
+        print(f"[dl-job] {job_id} wget not found, falling back to yt-dlp", file=sys.stderr)
+        return False
+    except Exception as exc:
+        print(f"[dl-job] {job_id} wget error: {exc}", file=sys.stderr)
+        return False
 
-    filepath, filename = _job_filepath(safe_title, ep, season, resolution)
 
-    # Already on disk
-    if os.path.exists(filepath) and os.path.getsize(filepath) > 50 * 1_048_576:
-        print(f"[auto-dl] Already on disk: {filename}", file=sys.stderr)
-        return
-
-    # Check any resolution variant
-    if _find_local_file(safe_title, ep, season):
-        print(f"[auto-dl] Variant already on disk: {safe_title}", file=sys.stderr)
-        return
-
-    # Acquire semaphore — block until a slot is free
-    with _dl_semaphore:
-        # Re-check inside the lock
-        if _find_local_file(safe_title, ep, season):
-            return
-
-        source_url = None
-        is_embed   = False
-
-        # 1. Passive capture cache
-        if subject_id:
-            vkey   = f"{subject_id}:{ep}:{season}:{resolution}"
-            cached = _video_url_cache.get(vkey)
-            if cached and time.time() - cached.get("ts", 0) < VIDEO_URL_TTL:
-                source_url = cached["url"]
-                print(f"[auto-dl] Source: passive-cache — {filename}", file=sys.stderr)
-
-        # 2. BWM direct MP4
-        if not source_url and subject_id:
-            try:
-                bwm = scraper.get_video_sources_bwm(subject_id, ep=ep, season=season, title=title)
-                if bwm:
-                    res_map = {"1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
-                    best = min(bwm, key=lambda s: abs(res_map.get(s["quality"], 0) - resolution))
-                    source_url = best["url"]
-                    print(f"[auto-dl] Source: bwm ({best['quality']}) — {filename}", file=sys.stderr)
-            except Exception as exc:
-                print(f"[auto-dl] BWM error: {exc}", file=sys.stderr)
-
-        # 3. vidsrc.to embed → yt-dlp extracts + downloads in one shot
-        if not source_url and imdb_id and imdb_id.startswith("tt"):
-            s = max(season, 1)
-            if is_series:
-                source_url = f"https://vidsrc.to/embed/tv/{imdb_id}/{s}/{ep}"
-            else:
-                source_url = f"https://vidsrc.to/embed/movie/{imdb_id}"
-            is_embed = True
-            print(f"[auto-dl] Source: vidsrc.to embed — {filename}", file=sys.stderr)
-
-        if not source_url:
-            print(f"[auto-dl] No source found for: {filename}", file=sys.stderr)
-            return
-
-        # Register as a proper job so /download-job/ can track it
-        job_id = f"auto_{safe_title}_{ep}_{season}_{resolution}"
-        _download_jobs[job_id] = {
-            "status": "queued", "progress": 0,
-            "filepath": filepath, "filename": filename,
-            "ts": time.time(), "auto": True,
-        }
-        _run_download_job(job_id, source_url, filepath, filename, is_embed)
+def _download_via_ytdlp(job_id: str, url: str, filepath: str) -> tuple[bool, str]:
+    """
+    Download any URL (embed page or direct HLS/MP4) using yt-dlp.
+    Returns (success, error_message).
+    """
+    import sys
+    _ensure_download_dir()
+    cmd = [
+        "yt-dlp",
+        "--no-warnings", "--no-check-certificate",
+        "--no-playlist", "--newline",
+        "--merge-output-format", "mp4",
+        "-o", filepath,
+        url,
+    ]
+    print(f"[dl-job] {job_id} yt-dlp {url[:80]}", file=sys.stderr)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:  # type: ignore[union-attr]
+            line = line.strip()
+            if "[download]" in line and "%" in line:
+                try:
+                    pct = float(line.split("%")[0].strip().split()[-1])
+                    if job_id in _download_jobs:
+                        _download_jobs[job_id]["progress"] = round(min(pct, 99.9), 1)
+                except Exception:
+                    pass
+        proc.wait()
+        if proc.returncode == 0 and os.path.exists(filepath) and os.path.getsize(filepath) > 1_048_576:
+            return True, ""
+        return False, f"yt-dlp exit code {proc.returncode}"
+    except FileNotFoundError:
+        return False, "yt-dlp not installed — run: pip install -U yt-dlp"
+    except Exception as exc:
+        return False, str(exc)
 
 
 def _run_download_job(
@@ -412,54 +407,144 @@ def _run_download_job(
     filename: str,
     is_embed: bool,
 ) -> None:
-    """Background thread: downloads the video to VPS disk using yt-dlp."""
+    """
+    Execute a single download job.  Job must already be registered in _download_jobs.
+    Strategy:
+      - direct MP4/m3u8 URL  → wget first (fast), fall back to yt-dlp
+      - embed page URL        → yt-dlp only (needs extraction)
+    """
+    import sys
+    _download_jobs[job_id]["status"] = "downloading"
+    print(f"[dl-job] {job_id} START embed={is_embed} — {source_url[:80]}", file=sys.stderr)
+
+    success = False
+    err_msg = ""
+
+    if not is_embed:
+        # Direct URL — try wget first, then yt-dlp
+        success = _download_direct_mp4(job_id, source_url, filepath, headers={
+            "Referer": "https://moviebox.ac",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        })
+        if not success:
+            success, err_msg = _download_via_ytdlp(job_id, source_url, filepath)
+    else:
+        # Embed page — yt-dlp only
+        success, err_msg = _download_via_ytdlp(job_id, source_url, filepath)
+
+    if success:
+        # Verify size gate (>10 MB = real content, not an error page)
+        size = os.path.getsize(filepath)
+        if size < 10 * 1_048_576:
+            os.remove(filepath)
+            _download_jobs[job_id].update({"status": "error", "error": f"File too small ({size//1024} KB) — likely a promo/error"})
+            print(f"[dl-job] {job_id} SIZE-GATE: {size//1024} KB — deleted", file=sys.stderr)
+        else:
+            size_mb = size // 1_048_576
+            print(f"[dl-job] {job_id} DONE — {size_mb} MB", file=sys.stderr)
+            _download_jobs[job_id].update({"status": "ready", "progress": 100, "size_mb": size_mb})
+            _bulk_stats["downloaded"] = _bulk_stats.get("downloaded", 0) + 1
+    else:
+        print(f"[dl-job] {job_id} FAILED — {err_msg}", file=sys.stderr)
+        _download_jobs[job_id].update({"status": "error", "error": err_msg or "Download failed"})
+        _bulk_stats["dl_errors"] = _bulk_stats.get("dl_errors", 0) + 1
+
+
+def _resolve_source(stream: dict, ep: int, season: int, resolution: int) -> tuple[Optional[str], bool, str]:
+    """
+    Try all available sources for a title. Returns (url, is_embed, source_name) or (None, False, "").
+    Sources tried in order: passive_cache → BWM → aoneroom_api → vidsrc_embed
+    """
+    import sys
+    subject_id = stream.get("id", "")
+    imdb_id    = stream.get("imdb_id", "")
+    is_series  = stream.get("is_series", False)
+    title      = stream.get("title", "")
+
+    # 1. Passive capture cache (someone already streamed this)
+    if subject_id:
+        vkey = f"{subject_id}:{ep}:{season}:{resolution}"
+        cached = _video_url_cache.get(vkey)
+        if cached and time.time() - cached.get("ts", 0) < VIDEO_URL_TTL:
+            return cached["url"], False, "passive_cache"
+
+    # 2. BWM direct MP4
+    if subject_id:
+        try:
+            bwm = scraper.get_video_sources_bwm(subject_id, ep=ep, season=season, title=title)
+            if bwm:
+                res_map = {"1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
+                best = min(bwm, key=lambda s: abs(res_map.get(s["quality"], 0) - resolution))
+                return best["url"], False, f"bwm_{best['quality']}"
+        except Exception as exc:
+            print(f"[resolve] BWM error: {exc}", file=sys.stderr)
+
+    # 3. Aoneroom API endpoints
+    if subject_id:
+        try:
+            ao = scraper.get_video_url(subject_id, ep=ep, season=season, resolution=resolution)
+            if ao and ao.get("url"):
+                return ao["url"], False, "aoneroom"
+        except Exception as exc:
+            print(f"[resolve] aoneroom error: {exc}", file=sys.stderr)
+
+    # 4. vidsrc.to embed → yt-dlp extracts and downloads in one pass
+    if imdb_id and imdb_id.startswith("tt"):
+        s = max(season, 1)
+        if is_series:
+            url = f"https://vidsrc.to/embed/tv/{imdb_id}/{s}/{ep}"
+        else:
+            url = f"https://vidsrc.to/embed/movie/{imdb_id}"
+        return url, True, "vidsrc_embed"
+
+    return None, False, ""
+
+
+def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 1080) -> None:
+    """
+    Background worker: resolve source → download to VPS disk.
+    Job is registered in _download_jobs IMMEDIATELY so it's always visible in /library-status.
+    """
     import sys
 
-    _download_jobs[job_id]["status"] = "downloading"
-    _ensure_download_dir()
+    safe_title = _safe_name(stream.get("title", "unknown"))[:60]
+    filepath, filename = _job_filepath(safe_title, ep, season, resolution)
 
-    cmd = [
-        "yt-dlp",
-        "--no-warnings",
-        "--no-check-certificate",
-        "--newline",
-        "--no-playlist",
-        "-o", filepath,
-        source_url,
-    ]
-    if not is_embed:
-        # For direct MP4/m3u8 we still want yt-dlp to handle merging/remux
-        cmd.insert(1, "--no-mtime")
+    # Pre-register job BEFORE acquiring semaphore — always visible in status
+    job_id = f"auto_{safe_title}_{ep}_{season}"
+    _download_jobs[job_id] = {
+        "status": "pending", "progress": 0,
+        "filepath": filepath, "filename": filename,
+        "title": stream.get("title", ""),
+        "ts": time.time(), "auto": True,
+    }
 
-    print(f"[dl-job] {job_id} START — embed={is_embed} — {source_url[:80]}", file=sys.stderr)
-    try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-        )
-        for line in proc.stdout:  # type: ignore[union-attr]
-            line = line.strip()
-            if "[download]" in line and "%" in line:
-                try:
-                    pct = float(line.split("%")[0].strip().split()[-1])
-                    _download_jobs[job_id]["progress"] = round(min(pct, 99.9), 1)
-                except Exception:
-                    pass
-        proc.wait()
+    # Early exit: already on disk
+    if _find_local_file(safe_title, ep, season):
+        _download_jobs[job_id]["status"] = "skipped_exists"
+        return
 
-        if proc.returncode == 0 and os.path.exists(filepath):
-            size = os.path.getsize(filepath)
-            print(f"[dl-job] {job_id} DONE — {size // 1_048_576} MB — {filepath}", file=sys.stderr)
-            _download_jobs[job_id].update(
-                {"status": "ready", "progress": 100, "size_mb": size // 1_048_576}
-            )
-        else:
-            print(f"[dl-job] {job_id} FAILED rc={proc.returncode}", file=sys.stderr)
-            _download_jobs[job_id].update({"status": "error", "error": "yt-dlp returned non-zero exit code"})
-    except FileNotFoundError:
-        _download_jobs[job_id].update({"status": "error", "error": "yt-dlp not installed on server"})
-    except Exception as exc:
-        print(f"[dl-job] {job_id} ERROR: {exc}", file=sys.stderr)
-        _download_jobs[job_id].update({"status": "error", "error": str(exc)})
+    # Wait for a download slot
+    _download_jobs[job_id]["status"] = "waiting"
+    with _dl_semaphore:
+        # Re-check inside lock
+        if _find_local_file(safe_title, ep, season):
+            _download_jobs[job_id]["status"] = "skipped_exists"
+            return
+
+        # Resolve source URL
+        source_url, is_embed, src_name = _resolve_source(stream, ep, season, resolution)
+        _download_jobs[job_id]["source"] = src_name
+
+        if not source_url:
+            msg = f"No source — imdb_id={stream.get('imdb_id','')} subject_id={stream.get('id','')}"
+            print(f"[auto-dl] {filename}: {msg}", file=sys.stderr)
+            _download_jobs[job_id].update({"status": "error", "error": msg})
+            _bulk_stats["dl_errors"] = _bulk_stats.get("dl_errors", 0) + 1
+            return
+
+        print(f"[auto-dl] {filename} via {src_name}", file=sys.stderr)
+        _run_download_job(job_id, source_url, filepath, filename, is_embed)
 
 
 VIDEO_URL_TTL = 7200  # 2 hours
@@ -1218,23 +1303,40 @@ async def library_status():
                 except OSError:
                     pass
 
-    # Snapshot active / queued jobs
+    all_jobs = list(_download_jobs.values())
+
+    # Active / in-flight
     active_jobs = [
         {
-            "job_id":   jid,
+            "title":    job.get("title", job.get("filename", "")),
             "status":   job["status"],
             "progress": job.get("progress", 0),
-            "filename": job.get("filename", ""),
-            "auto":     job.get("auto", False),
+            "source":   job.get("source", ""),
         }
-        for jid, job in list(_download_jobs.items())
-        if job["status"] in ("queued", "downloading")
+        for job in all_jobs
+        if job["status"] in ("pending", "waiting", "queued", "downloading")
     ]
+
+    # Last 10 errors — most useful for debugging
+    error_jobs = [
+        {
+            "title":  job.get("title", job.get("filename", "")),
+            "error":  job.get("error", ""),
+            "source": job.get("source", ""),
+        }
+        for job in all_jobs
+        if job["status"] == "error"
+    ][-10:]
 
     elapsed = None
     if _bulk_stats.get("started_at"):
         end = _bulk_stats.get("finished_at") or time.time()
         elapsed = round(end - _bulk_stats["started_at"])
+
+    by_status: dict = {}
+    for j in all_jobs:
+        s = j["status"]
+        by_status[s] = by_status.get(s, 0) + 1
 
     return {
         "library": {
@@ -1243,15 +1345,14 @@ async def library_status():
             "path":        _DOWNLOAD_DIR,
         },
         "bulk_builder": {
-            "active":       _bulk_active,
+            "active":         _bulk_active,
             "stop_requested": _bulk_stop,
-            "elapsed_sec":  elapsed,
-            "stats":        _bulk_stats,
+            "elapsed_sec":    elapsed,
+            "stats":          _bulk_stats,
         },
-        "active_downloads":   active_jobs,
-        "queued_count":       sum(1 for j in _download_jobs.values() if j["status"] == "queued"),
-        "downloading_count":  sum(1 for j in _download_jobs.values() if j["status"] == "downloading"),
-        "completed_count":    sum(1 for j in _download_jobs.values() if j["status"] == "ready"),
+        "jobs_by_status":   by_status,
+        "active_downloads": active_jobs,
+        "last_errors":      error_jobs,
     }
 
 

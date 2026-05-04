@@ -717,7 +717,26 @@ async def download_info(
     safe_title = re.sub(r"[^a-zA-Z0-9_\-]", "_", stream.get("title", detail_path))
     subject_id = stream.get("id", "")
 
-    # 1. Passive-capture cache (populated when anyone watches via the proxy player)
+    # 1. BWM / GiftedTech — direct MP4 URLs, multiple qualities, no conversion needed
+    if subject_id:
+        bwm_sources = scraper.get_video_sources_bwm(
+            subject_id, ep=ep, season=season, title=stream.get("title", safe_title)
+        )
+        if bwm_sources:
+            # Pick best quality matching the requested resolution for the legacy single-url fields
+            res_map = {"1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
+            best = min(bwm_sources, key=lambda s: abs(res_map.get(s["quality"], 0) - resolution))
+            return {
+                "available": True,
+                "sources": bwm_sources,          # full multi-quality list for the UI
+                "url": best["url"],              # best-match for legacy /download flow
+                "type": "mp4",
+                "filename": best["filename"],
+                "needs_conversion": False,
+                "source": "bwm",
+            }
+
+    # 2. Passive-capture cache (populated when anyone watches via the proxy player)
     if subject_id:
         vkey = f"{subject_id}:{ep}:{season}:{resolution}"
         cached = _video_url_cache.get(vkey)
@@ -732,7 +751,7 @@ async def download_info(
                 "source": "cache",
             }
 
-    # 2. Video URLs already extracted from the resource data (zero extra requests)
+    # 3. Video URLs already extracted from the resource data (zero extra requests)
     for u in stream.get("_found_video_urls") or []:
         if u.get("ep") == ep and (not season or u.get("season") == season):
             if abs(u.get("resolution", 0) - resolution) <= 360:
@@ -746,7 +765,7 @@ async def download_info(
                     "source": "resource",
                 }
 
-    # 3. Probe netfilm.world (player API + HTML parse)
+    # 4. Probe netfilm.world (player API + HTML parse)
     if subject_id:
         nf_info = scraper.get_video_url_from_netfilm(
             subject_id, detail_path=detail_path, ep=ep, season=season, resolution=resolution
@@ -762,7 +781,7 @@ async def download_info(
                 "source": "netfilm",
             }
 
-    # 4. Probe aoneroom video API endpoints directly
+    # 5. Probe aoneroom video API endpoints directly
     if subject_id:
         ao_info = scraper.get_video_url(subject_id, ep=ep, season=season, resolution=resolution)
         if ao_info:
@@ -776,7 +795,7 @@ async def download_info(
                 "source": "aoneroom",
             }
 
-    # 5. Trailer fallback
+    # 6. Trailer fallback
     trailer = stream.get("trailer") or {}
     turl = trailer.get("url")
     is_series = stream.get("is_series", False)

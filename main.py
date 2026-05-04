@@ -1275,10 +1275,95 @@ async def proxy_player(request: Request, path: str = ""):
                 "})();"
                 "</script>"
             )
+            # Video URL capture script — intercepts fetch/XHR in the player page
+            # and reports video URLs back to /report-video so /download can use them.
+            video_capture_script = (
+                "<script>"
+                "(function(){"
+                "var sp=new URLSearchParams(window.location.search);"
+                "var sid=sp.get('id')||sp.get('subjectId')||'';"
+                "var ep=sp.get('ep')||'1';"
+                "var se=sp.get('se')||'0';"
+                "var res=sp.get('resolution')||'1080';"
+                "if(!sid)return;"
+                "var _done=false;"
+                "var _NON=['.js','.css','.html','.json','.png','.jpg','.ico','.woff','.woff2','.ttf','.map','.svg','.gif','.xml'];"
+                "function isVid(u){"
+                "if(!u||typeof u!=='string'||u.indexOf('http')!==0)return false;"
+                "var low=u.toLowerCase().split('?')[0];"
+                "if(_NON.some(function(e){return low.slice(-e.length)===e;}))return false;"
+                "if(low.indexOf('.m3u8')>=0||low.indexOf('.mp4')>=0||low.indexOf('.webm')>=0)return true;"
+                "if(['pbcdnw.aoneroom.com','pbcdn.aoneroom.com','macdn.aoneroom.com'].some(function(d){return u.indexOf(d)>=0;}))return true;"
+                "return false;"
+                "}"
+                "function findVid(obj,depth){"
+                "if(!obj||depth>6)return null;"
+                "if(typeof obj==='string')return isVid(obj)?obj:null;"
+                "if(Array.isArray(obj)){for(var i=0;i<Math.min(obj.length,8);i++){var r=findVid(obj[i],depth+1);if(r)return r;}return null;}"
+                "if(typeof obj==='object'){"
+                "var keys=['url','videoUrl','playUrl','hlsUrl','m3u8Url','source','address','streamUrl','mediaUrl','fileUrl','videoAddress'];"
+                "for(var i=0;i<keys.length;i++){var v=obj[keys[i]];if(isVid(v))return v;}"
+                "var vals=Object.values(obj);"
+                "for(var i=0;i<vals.length;i++){if(vals[i]&&typeof vals[i]==='object'){var r=findVid(vals[i],depth+1);if(r)return r;}}"
+                "}"
+                "return null;"
+                "}"
+                "function report(url){"
+                "if(_done)return;_done=true;"
+                "var t=url.indexOf('.m3u8')>=0?'m3u8':'mp4';"
+                "try{"
+                "fetch('/movies-api/report-video',{"
+                "method:'POST',"
+                "headers:{'Content-Type':'application/json'},"
+                "body:JSON.stringify({subject_id:sid,ep:ep,season:se,resolution:res,url:url,type:t})"
+                "});"
+                "}catch(e){}"
+                "}"
+                # Intercept fetch
+                "var _oF=window.fetch;"
+                "window.fetch=function(url,opts){"
+                "return _oF.call(this,url,opts).then(function(resp){"
+                "if(_done)return resp;"
+                "var ct=resp.headers.get('content-type')||'';"
+                "if(ct.indexOf('json')>=0){resp.clone().json().then(function(d){var v=findVid(d,0);if(v)report(v);}).catch(function(){});}"
+                "return resp;"
+                "});"
+                "};"
+                # Intercept XHR
+                "var _oO=XMLHttpRequest.prototype.open,_oS=XMLHttpRequest.prototype.send;"
+                "XMLHttpRequest.prototype.open=function(m,u){this._vu=u;return _oO.apply(this,arguments);};"
+                "XMLHttpRequest.prototype.send=function(){"
+                "var x=this;"
+                "x.addEventListener('load',function(){"
+                "if(_done)return;"
+                "var ct=x.getResponseHeader('content-type')||'';"
+                "if(ct.indexOf('json')>=0&&x.responseText){"
+                "try{var d=JSON.parse(x.responseText);var v=findVid(d,0);if(v)report(v);}catch(e){}"
+                "}"
+                "});"
+                "return _oS.apply(this,arguments);"
+                "};"
+                # Also watch for video/source elements appearing in DOM
+                "var _vob=new MutationObserver(function(muts){"
+                "muts.forEach(function(m){"
+                "m.addedNodes.forEach(function(n){"
+                "if(!n||n.nodeType!==1)return;"
+                "var srcs=[];"
+                "if(n.tagName==='VIDEO'||n.tagName==='SOURCE')srcs.push(n.src||n.getAttribute('src'));"
+                "if(n.querySelectorAll)n.querySelectorAll('video,source').forEach(function(el){srcs.push(el.src||el.getAttribute('src'));});"
+                "srcs.forEach(function(s){if(isVid(s))report(s);});"
+                "});"
+                "});"
+                "});"
+                "_vob.observe(document.documentElement,{childList:true,subtree:true});"
+                "})();"
+                "</script>"
+            )
+
             # Inject ad-block script at the VERY TOP of <head> so it runs before any page script
-            text = text.replace("<head>", "<head>" + ad_block_script, 1)
+            text = text.replace("<head>", "<head>" + ad_block_script + video_capture_script, 1)
             if "<head>" not in text:
-                text = text.replace("<html", "<head>" + ad_block_script + "</head><html", 1)
+                text = text.replace("<html", "<head>" + ad_block_script + video_capture_script + "</head><html", 1)
             text = text.replace("</body>", fix_script + "</body>", 1)
 
         body = text.encode("utf-8")
@@ -1300,6 +1385,29 @@ async def proxy_player(request: Request, path: str = ""):
 
     return Response(content=body, status_code=r.status_code,
                     headers=resp_headers, media_type=ct)
+
+
+@app.post("/report-video")
+async def report_video(request: Request):
+    """Browser player reports a discovered video URL so /download can use it."""
+    import sys
+    from chege_scraper import _is_video_url
+    try:
+        payload    = await request.json()
+        url        = payload.get("url", "")
+        subject_id = str(payload.get("subject_id", ""))
+        ep         = str(payload.get("ep", "1"))
+        season     = str(payload.get("season", "0"))
+        resolution = str(payload.get("resolution", "1080"))
+        vtype      = payload.get("type", "mp4")
+        if not subject_id or not _is_video_url(url):
+            return {"ok": False, "reason": "invalid url or missing subject_id"}
+        vkey = f"{subject_id}:{ep}:{season}:{resolution}"
+        _video_url_cache[vkey] = {"url": url, "type": vtype, "ts": time.time()}
+        print(f"[report-video] Cached {vkey}: {url[:100]}", file=sys.stderr)
+        return {"ok": True, "cached": vkey}
+    except Exception as exc:
+        return {"ok": False, "reason": str(exc)}
 
 
 MOOD_MAP: dict = {

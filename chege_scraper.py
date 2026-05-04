@@ -571,6 +571,31 @@ class ChegeScraper:
         # Reject trailer/teaser/sample URLs — these are NOT the real movie
         _TRAILER_SIGNALS = ("trailer", "teaser", "preview", "sample", "promo", "clip", "featurette")
 
+        # Minimum file size for a real movie/episode (20 MB).
+        # A 4 MB "movie" is a trailer/promo, even if the URL looks fine.
+        _MIN_BYTES = 20 * 1024 * 1024  # 20 MB
+
+        import sys
+
+        def _check_size(check_url: str) -> bool:
+            """HEAD request to get Content-Length. Reject if known and < _MIN_BYTES."""
+            try:
+                head_req = _req.Request(check_url, method="HEAD", headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": "https://zone.bwmxmd.co.ke/",
+                })
+                with _req.urlopen(head_req, timeout=5) as r:
+                    cl = r.headers.get("Content-Length")
+                    if cl:
+                        size = int(cl)
+                        if size < _MIN_BYTES:
+                            print(f"[bwm-sources] size too small ({size//1024} KB) — skipping: {check_url[:80]}", file=sys.stderr)
+                            return False
+            except Exception as e:
+                # Can't determine size — accept it and let the browser deal with it
+                print(f"[bwm-sources] HEAD failed ({e}), accepting: {check_url[:80]}", file=sys.stderr)
+            return True
+
         out = []
         for item in results:
             q = item.get("quality", "")
@@ -580,8 +605,9 @@ class ChegeScraper:
             url_lower = dl_url.lower()
             label_lower = (item.get("label", "") or q).lower()
             if any(sig in url_lower or sig in label_lower for sig in _TRAILER_SIGNALS):
-                import sys
                 print(f"[bwm-sources] skipping trailer URL: {dl_url[:80]}", file=sys.stderr)
+                continue
+            if not _check_size(dl_url):
                 continue
             out.append({
                 "quality": q,

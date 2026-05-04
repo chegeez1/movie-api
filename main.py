@@ -372,17 +372,28 @@ def _download_via_ytdlp(job_id: str, url: str, filepath: str) -> tuple[bool, str
     _ensure_download_dir()
     cmd = [
         "yt-dlp",
-        "--no-warnings", "--no-check-certificate",
-        "--no-playlist", "--newline",
-        "--merge-output-format", "mp4",
+        "--no-check-certificate",
+        "--no-playlist",
+        "--newline",
+        "--geo-bypass",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "--add-headers", "Referer:https://www.google.com",
         "-o", filepath,
         url,
     ]
     print(f"[dl-job] {job_id} yt-dlp {url[:80]}", file=sys.stderr)
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,   # separate stderr to capture real errors
+            text=True,
+        )
+        # Drain stdout for progress updates
+        stdout_lines = []
         for line in proc.stdout:  # type: ignore[union-attr]
             line = line.strip()
+            stdout_lines.append(line)
             if "[download]" in line and "%" in line:
                 try:
                     pct = float(line.split("%")[0].strip().split()[-1])
@@ -390,12 +401,31 @@ def _download_via_ytdlp(job_id: str, url: str, filepath: str) -> tuple[bool, str
                         _download_jobs[job_id]["progress"] = round(min(pct, 99.9), 1)
                 except Exception:
                     pass
+        stderr_out = proc.stderr.read().strip()  # type: ignore[union-attr]
         proc.wait()
-        if proc.returncode == 0 and os.path.exists(filepath) and os.path.getsize(filepath) > 1_048_576:
+
+        # Check for a real output file
+        actual = filepath
+        # yt-dlp may add extension — check for .mp4 / .mkv / .webm variants
+        if not os.path.exists(actual):
+            for ext in (".mp4", ".mkv", ".webm", ".m4v"):
+                if os.path.exists(filepath + ext):
+                    try:
+                        os.rename(filepath + ext, actual)
+                    except OSError:
+                        actual = filepath + ext
+                    break
+
+        if proc.returncode == 0 and os.path.exists(actual) and os.path.getsize(actual) > 1_048_576:
             return True, ""
-        return False, f"yt-dlp exit code {proc.returncode}"
+
+        # Build a useful error — first meaningful line from stderr
+        err_lines = [l for l in stderr_out.splitlines() if l.strip() and "WARNING" not in l]
+        err_summary = err_lines[-1][:120] if err_lines else f"exit code {proc.returncode}"
+        print(f"[dl-job] {job_id} yt-dlp FAIL: {err_summary}", file=sys.stderr)
+        return False, err_summary
     except FileNotFoundError:
-        return False, "yt-dlp not installed — run: pip install -U yt-dlp"
+        return False, "yt-dlp not installed — run: pip install -U yt-dlp --break-system-packages"
     except Exception as exc:
         return False, str(exc)
 
@@ -450,23 +480,43 @@ def _run_download_job(
         _bulk_stats["dl_errors"] = _bulk_stats.get("dl_errors", 0) + 1
 
 
-def _resolve_source(stream: dict, ep: int, season: int, resolution: int) -> tuple[Optional[str], bool, str]:
+def _embed_urls_for(imdb_id: str, is_series: bool, ep: int, season: int) -> list[tuple[str, str]]:
     """
-    Try all available sources for a title. Returns (url, is_embed, source_name) or (None, False, "").
-    Sources tried in order: passive_cache → BWM → aoneroom_api → vidsrc_embed
+    Return ordered list of (embed_url, source_name) to try with yt-dlp.
+    Ordered from most likely to work → least.
+    """
+    s = max(season, 1)
+    if is_series:
+        return [
+            (f"https://vidsrc.me/embed/tv?imdb={imdb_id}&season={s}&episode={ep}", "vidsrc.me"),
+            (f"https://vidsrc.xyz/embed/tv/{imdb_id}?season={s}&episode={ep}",     "vidsrc.xyz"),
+            (f"https://2embed.cc/embedtv/{imdb_id}&s={s}&e={ep}",                  "2embed"),
+            (f"https://vidsrc.to/embed/tv/{imdb_id}/{s}/{ep}",                     "vidsrc.to"),
+        ]
+    else:
+        return [
+            (f"https://vidsrc.me/embed/movie?imdb={imdb_id}",    "vidsrc.me"),
+            (f"https://vidsrc.xyz/embed/movie/{imdb_id}",         "vidsrc.xyz"),
+            (f"https://2embed.cc/embed/{imdb_id}",                "2embed"),
+            (f"https://vidsrc.to/embed/movie/{imdb_id}",          "vidsrc.to"),
+        ]
+
+
+def _resolve_direct_source(stream: dict, ep: int, season: int, resolution: int) -> tuple[Optional[str], str]:
+    """
+    Try fast/direct sources (no yt-dlp needed): passive_cache → BWM → aoneroom.
+    Returns (url, source_name) or (None, "").
     """
     import sys
     subject_id = stream.get("id", "")
-    imdb_id    = stream.get("imdb_id", "")
-    is_series  = stream.get("is_series", False)
     title      = stream.get("title", "")
 
-    # 1. Passive capture cache (someone already streamed this)
+    # 1. Passive capture cache
     if subject_id:
         vkey = f"{subject_id}:{ep}:{season}:{resolution}"
         cached = _video_url_cache.get(vkey)
         if cached and time.time() - cached.get("ts", 0) < VIDEO_URL_TTL:
-            return cached["url"], False, "passive_cache"
+            return cached["url"], "passive_cache"
 
     # 2. BWM direct MP4
     if subject_id:
@@ -475,39 +525,33 @@ def _resolve_source(stream: dict, ep: int, season: int, resolution: int) -> tupl
             if bwm:
                 res_map = {"1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
                 best = min(bwm, key=lambda s: abs(res_map.get(s["quality"], 0) - resolution))
-                return best["url"], False, f"bwm_{best['quality']}"
+                return best["url"], f"bwm_{best['quality']}"
         except Exception as exc:
-            print(f"[resolve] BWM error: {exc}", file=sys.stderr)
+            print(f"[resolve] BWM: {exc}", file=sys.stderr)
 
-    # 3. Aoneroom API endpoints
+    # 3. Aoneroom API
     if subject_id:
         try:
             ao = scraper.get_video_url(subject_id, ep=ep, season=season, resolution=resolution)
             if ao and ao.get("url"):
-                return ao["url"], False, "aoneroom"
+                return ao["url"], "aoneroom"
         except Exception as exc:
-            print(f"[resolve] aoneroom error: {exc}", file=sys.stderr)
+            print(f"[resolve] aoneroom: {exc}", file=sys.stderr)
 
-    # 4. vidsrc.to embed → yt-dlp extracts and downloads in one pass
-    if imdb_id and imdb_id.startswith("tt"):
-        s = max(season, 1)
-        if is_series:
-            url = f"https://vidsrc.to/embed/tv/{imdb_id}/{s}/{ep}"
-        else:
-            url = f"https://vidsrc.to/embed/movie/{imdb_id}"
-        return url, True, "vidsrc_embed"
-
-    return None, False, ""
+    return None, ""
 
 
 def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 1080) -> None:
     """
     Background worker: resolve source → download to VPS disk.
     Job is registered in _download_jobs IMMEDIATELY so it's always visible in /library-status.
+    Tries direct sources first, then each embed source in order until one works.
     """
     import sys
 
     safe_title = _safe_name(stream.get("title", "unknown"))[:60]
+    imdb_id    = stream.get("imdb_id", "")
+    is_series  = stream.get("is_series", False)
     filepath, filename = _job_filepath(safe_title, ep, season, resolution)
 
     # Pre-register job BEFORE acquiring semaphore — always visible in status
@@ -532,19 +576,52 @@ def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 
             _download_jobs[job_id]["status"] = "skipped_exists"
             return
 
-        # Resolve source URL
-        source_url, is_embed, src_name = _resolve_source(stream, ep, season, resolution)
-        _download_jobs[job_id]["source"] = src_name
+        # ── Step 1: try direct sources (BWM / cache / aoneroom) ──────────────
+        direct_url, src_name = _resolve_direct_source(stream, ep, season, resolution)
+        if direct_url:
+            _download_jobs[job_id]["source"] = src_name
+            print(f"[auto-dl] {filename} via {src_name} (direct)", file=sys.stderr)
+            _run_download_job(job_id, direct_url, filepath, filename, is_embed=False)
+            if _download_jobs[job_id]["status"] == "ready":
+                return
+            print(f"[auto-dl] Direct source failed, trying embeds", file=sys.stderr)
 
-        if not source_url:
-            msg = f"No source — imdb_id={stream.get('imdb_id','')} subject_id={stream.get('id','')}"
-            print(f"[auto-dl] {filename}: {msg}", file=sys.stderr)
-            _download_jobs[job_id].update({"status": "error", "error": msg})
-            _bulk_stats["dl_errors"] = _bulk_stats.get("dl_errors", 0) + 1
+        # ── Step 2: try embed sources in order until one works ───────────────
+        if not (imdb_id and imdb_id.startswith("tt")):
+            if _download_jobs[job_id]["status"] != "ready":
+                msg = f"No IMDB ID — cannot try embed sources (subject_id={stream.get('id','')})"
+                _download_jobs[job_id].update({"status": "error", "error": msg})
+                _bulk_stats["dl_errors"] = _bulk_stats.get("dl_errors", 0) + 1
             return
 
-        print(f"[auto-dl] {filename} via {src_name}", file=sys.stderr)
-        _run_download_job(job_id, source_url, filepath, filename, is_embed)
+        last_err = ""
+        for embed_url, embed_src in _embed_urls_for(imdb_id, is_series, ep, season):
+            if _find_local_file(safe_title, ep, season):
+                _download_jobs[job_id]["status"] = "ready"
+                return
+            _download_jobs[job_id]["source"] = embed_src
+            _download_jobs[job_id]["progress"] = 0
+            print(f"[auto-dl] {filename} trying embed: {embed_src}", file=sys.stderr)
+            ok, err = _download_via_ytdlp(job_id, embed_url, filepath)
+            if ok and os.path.exists(filepath) and os.path.getsize(filepath) > 10 * 1_048_576:
+                size_mb = os.path.getsize(filepath) // 1_048_576
+                _download_jobs[job_id].update({"status": "ready", "progress": 100, "size_mb": size_mb})
+                _bulk_stats["downloaded"] = _bulk_stats.get("downloaded", 0) + 1
+                print(f"[auto-dl] {filename} DONE via {embed_src} — {size_mb} MB", file=sys.stderr)
+                return
+            last_err = f"{embed_src}: {err}"
+            print(f"[auto-dl] {embed_src} failed: {err}", file=sys.stderr)
+            # Clean up partial file before next attempt
+            try:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+            except OSError:
+                pass
+
+        # All sources exhausted
+        _download_jobs[job_id].update({"status": "error", "error": f"All sources failed. Last: {last_err}"})
+        _bulk_stats["dl_errors"] = _bulk_stats.get("dl_errors", 0) + 1
+        print(f"[auto-dl] {filename} — all embed sources failed", file=sys.stderr)
 
 
 VIDEO_URL_TTL = 7200  # 2 hours

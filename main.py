@@ -924,25 +924,33 @@ async def download_movie(
         elif ao:
             print(f"[download] REJECTED aoneroom URL: {ao.get('url','')[:100]}", file=sys.stderr)
 
-    # 4. Fallback: trailer (use raw CDN URL, not img-proxy wrapper)
-    if not video_info:
-        trailer = stream.get("trailer") or {}
-        turl    = trailer.get("url", "")
-        # Unwrap img-proxy if needed (middleware rewrites CDN URLs; raw cache should have direct CDN)
-        if "/img?url=" in turl:
-            import urllib.parse as _up
-            turl = _up.unquote(turl.split("/img?url=", 1)[1].split("&")[0])
-        if turl and _is_video_url(turl):
-            video_info = {"url": turl, "type": "mp4"}
-            safe_title = f"{safe_title}_trailer"
-            dl_source  = "trailer"
-        elif turl:
-            print(f"[download] REJECTED trailer URL: {turl[:100]}", file=sys.stderr)
+    # ── Size-gate: reject anything under 50 MB — it's a trailer/promo ────────
+    _MIN_DL_BYTES = 50 * 1024 * 1024  # 50 MB
+    if video_info:
+        check_url = video_info["url"]
+        is_check_hls = ".m3u8" in check_url
+        if not is_check_hls:  # can't Content-Length an m3u8 playlist
+            try:
+                import urllib.request as _ur
+                head_req = _ur.Request(check_url, method="HEAD")
+                head_req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                head_req.add_header("Referer", "https://moviebox.ac")
+                with _ur.urlopen(head_req, timeout=8) as hr:
+                    cl = hr.headers.get("Content-Length") or "0"
+                    size = int(cl)
+                if size and size < _MIN_DL_BYTES:
+                    print(f"[download] SIZE-GATE: {size//1024//1024} MB < 50 MB — "
+                          f"source={dl_source} — rejecting trailer", file=sys.stderr)
+                    video_info = None
+                    dl_source  = "none"
+            except Exception as e:
+                print(f"[download] size-check failed ({e}) — accepting URL anyway", file=sys.stderr)
 
     if not video_info:
         raise HTTPException(
             status_code=404,
-            detail="No downloadable file found. Open the watch page and use the player's download option.",
+            detail="No full-length download source found for this title. "
+                   "Watch the episode on Server 2 first, then try downloading.",
         )
 
     video_url = video_info["url"]

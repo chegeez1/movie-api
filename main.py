@@ -453,8 +453,9 @@ def _run_download_job(
     if not is_embed:
         # Direct URL — try wget first, then yt-dlp
         success = _download_direct_mp4(job_id, source_url, filepath, headers={
-            "Referer": "https://moviebox.ac",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://netfilm.world/",
+            "Origin": "https://netfilm.world",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         })
         if not success:
             success, err_msg = _download_via_ytdlp(job_id, source_url, filepath)

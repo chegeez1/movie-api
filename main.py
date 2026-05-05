@@ -405,14 +405,25 @@ def _find_local_file(safe_title: str, ep: int, season: int) -> Optional[str]:
     def _search(s: int, e: int) -> Optional[str]:
         if not os.path.isdir(_DOWNLOAD_DIR):
             return None
-        prefix = f"{safe_title}_s{s:02d}e{e:02d}_"
+        # Pattern 1 (simple):      From_s01e01_1080p.mp4
+        # Pattern 2 (season range): From_S1-S4_s01e01_1080p.mp4
+        ep_tag   = f"_s{s:02d}e{e:02d}_"
+        prefix   = f"{safe_title}{ep_tag}"   # pattern 1
+        # Fast-path: exact resolution candidates for both patterns
         for res in ("1080p", "720p", "480p", "360p"):
-            candidate = os.path.join(_DOWNLOAD_DIR, f"{prefix}{res}.mp4")
-            if os.path.exists(candidate) and os.path.getsize(candidate) >= _MIN_REAL_FILE_BYTES:
-                return candidate
+            for ext in (".mp4", ".mkv"):
+                for p in (f"{safe_title}{ep_tag}{res}{ext}",):
+                    candidate = os.path.join(_DOWNLOAD_DIR, p)
+                    if os.path.exists(candidate) and os.path.getsize(candidate) >= _MIN_REAL_FILE_BYTES:
+                        return candidate
         try:
             for fname in os.listdir(_DOWNLOAD_DIR):
-                if fname.startswith(prefix) and fname.lower().endswith((".mp4", ".mkv", ".webm", ".m4v", ".avi")):
+                if not fname.lower().endswith((".mp4", ".mkv", ".webm", ".m4v", ".avi")):
+                    continue
+                # Pattern 1: Title_s01e01_*
+                # Pattern 2: Title_<anything>_s01e01_*  (season range in name)
+                if (fname.startswith(prefix) or
+                        (fname.startswith(safe_title + "_") and ep_tag in fname)):
                     fpath = os.path.join(_DOWNLOAD_DIR, fname)
                     if os.path.getsize(fpath) >= _MIN_REAL_FILE_BYTES:
                         return fpath

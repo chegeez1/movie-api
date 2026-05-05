@@ -1783,9 +1783,9 @@ async def stream_video(
     season: int = Query(0),
 ):
     """
-    Stream a locally-downloaded MP4 directly to the browser with HTTP Range support.
-    This lets the browser seek/scrub without re-downloading from the start.
-    No ads — the file is served straight from VPS disk.
+    Stream a locally-downloaded MP4 via X-Accel-Redirect.
+    FastAPI only resolves the filename; nginx serves the bytes directly from disk
+    using sendfile — no Python byte streaming, full kernel-speed throughput.
     """
     cache_key = f"stream:{detail_path}"
     stream = _cached(cache_key, scraper.get_stream_info, detail_path=detail_path)
@@ -1797,53 +1797,22 @@ async def stream_video(
     if not local_path:
         raise HTTPException(status_code=404, detail="File not on server yet")
 
-    file_size    = os.path.getsize(local_path)
-    range_header = request.headers.get("range")
-
-    common_headers = {
-        "Accept-Ranges": "bytes",
-        "Cache-Control": "no-cache",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length",
-    }
-
-    if range_header:
-        m = re.match(r"bytes=(\d+)-(\d*)", range_header)
-        if m:
-            start = int(m.group(1))
-            end   = int(m.group(2)) if m.group(2) else file_size - 1
-            end   = min(end, file_size - 1)
-            length = end - start + 1
-
-            async def range_iter():
-                with open(local_path, "rb") as f:
-                    f.seek(start)
-                    remaining = length
-                    while remaining > 0:
-                        chunk = f.read(min(65536, remaining))
-                        if not chunk:
-                            break
-                        remaining -= len(chunk)
-                        yield chunk
-
-            return StreamingResponse(
-                range_iter(), status_code=206, media_type="video/mp4",
-                headers={**common_headers,
-                         "Content-Range":  f"bytes {start}-{end}/{file_size}",
-                         "Content-Length": str(length)},
-            )
-
-    async def full_iter():
-        with open(local_path, "rb") as f:
-            while True:
-                chunk = f.read(65536)
-                if not chunk:
-                    break
-                yield chunk
-
-    return StreamingResponse(
-        full_iter(), status_code=200, media_type="video/mp4",
-        headers={**common_headers, "Content-Length": str(file_size)},
+    filename = os.path.basename(local_path)
+    # X-Accel-Redirect tells nginx to serve /_video_files/<filename> directly from disk.
+    # The /_video_files/ internal location maps to /opt/movie-downloads/.
+    # nginx handles Range requests, Content-Length, and sendfile automatically.
+    from fastapi.responses import Response
+    return Response(
+        status_code=200,
+        headers={
+            "X-Accel-Redirect":    f"/_video_files/{filename}",
+            "X-Accel-Buffering":   "yes",
+            "Content-Type":        "video/mp4",
+            "Accept-Ranges":       "bytes",
+            "Cache-Control":       "no-transform",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length",
+        },
     )
 
 

@@ -213,7 +213,8 @@ def _bulk_process_item(item: dict) -> None:
         _bulk_stats["skipped"] += 1
         return
 
-    _trigger_auto_download(stream, ep=ep, season=season)
+    # skip_playwright=True: bulk mode skips the slow 60s Playwright fallback
+    _trigger_auto_download(stream, ep=ep, season=season, skip_playwright=True)
     _bulk_stats["queued"] += 1
 
 
@@ -686,13 +687,15 @@ def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: i
     return None
 
 
-def _resolve_direct_source(stream: dict, ep: int, season: int, resolution: int) -> tuple[Optional[str], str]:
+def _resolve_direct_source(stream: dict, ep: int, season: int, resolution: int, skip_playwright: bool = False) -> tuple[Optional[str], str]:
     """
     Try all direct sources in order. Returns (url, source_name) or (None, "").
 
     Order:
       stream_meta  → passive_cache → BWM → aoneroom API
       → Playwright (loads local proxy, triggers JS, proxy captures CDN URL)
+
+    skip_playwright=True skips the slow Playwright step (used during bulk mode).
     """
     import sys
     subject_id  = stream.get("id", "")
@@ -766,7 +769,8 @@ def _resolve_direct_source(stream: dict, ep: int, season: int, resolution: int) 
 
     # 4. Playwright — loads the player page, intercepts JSON, captures CDN URL
     #    Semaphore ensures only one browser at a time to prevent crashes.
-    if subject_id and detail_path:
+    #    Skipped during bulk mode (skip_playwright=True) to avoid 60s timeouts.
+    if subject_id and detail_path and not skip_playwright:
         with _playwright_semaphore:
             url = _playwright_warm_cache(subject_id, detail_path, ep, season, resolution)
         if url and _is_video_url(url):
@@ -775,11 +779,12 @@ def _resolve_direct_source(stream: dict, ep: int, season: int, resolution: int) 
     return None, ""
 
 
-def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 1080) -> None:
+def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 1080, skip_playwright: bool = False) -> None:
     """
     Background worker: resolve source → download to VPS disk.
     Job is registered in _download_jobs IMMEDIATELY so it's always visible in /library-status.
     Tries direct sources first, then each embed source in order until one works.
+    skip_playwright=True skips the slow Playwright step (used during bulk downloads).
     """
     import sys
 
@@ -811,7 +816,7 @@ def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 
             return
 
         # ── Step 1: try direct sources (BWM / cache / aoneroom) ──────────────
-        direct_url, src_name = _resolve_direct_source(stream, ep, season, resolution)
+        direct_url, src_name = _resolve_direct_source(stream, ep, season, resolution, skip_playwright=skip_playwright)
         if direct_url:
             _download_jobs[job_id]["source"] = src_name
             print(f"[auto-dl] {filename} via {src_name} (direct)", file=sys.stderr)
@@ -1313,10 +1318,11 @@ async def popular_searches():
     return {"status": "success", "timestamp": now(), "data": {"searches": result}}
 
 
-def _trigger_auto_download(result: dict, ep: int = 1, season: int = 0) -> None:
+def _trigger_auto_download(result: dict, ep: int = 1, season: int = 0, skip_playwright: bool = False) -> None:
     """
     Fire-and-forget: auto-download this title to VPS disk if not already present.
     Key is (imdb_id or title, ep, season) — only queued once per server lifetime.
+    skip_playwright=True is used by bulk mode to avoid 60s Playwright timeouts.
     """
     import sys
     is_series = result.get("is_series", False)
@@ -1335,6 +1341,7 @@ def _trigger_auto_download(result: dict, ep: int = 1, season: int = 0) -> None:
     threading.Thread(
         target=_auto_download_worker,
         args=(result, _ep, _season),
+        kwargs={"skip_playwright": skip_playwright},
         daemon=True,
     ).start()
 

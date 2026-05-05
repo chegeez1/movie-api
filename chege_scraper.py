@@ -17,12 +17,16 @@ _VIDEO_CDN_DOMAINS = (
     "cdn.aoneroom.com",
 )
 
-# File extensions that are definitely NOT video files
+# File extensions that are definitely NOT video files (includes images and webp)
 _NON_VIDEO_EXTS = (
-    ".js", ".css", ".html", ".json", ".png", ".jpg", ".jpeg",
-    ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".map",
+    ".js", ".css", ".html", ".json",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".bmp", ".webp",
+    ".woff", ".woff2", ".ttf", ".map",
     ".xml", ".txt", ".pdf", ".zip",
 )
+
+# Must contain one of these to be a video even from a known CDN domain
+_VIDEO_SIGS = (".mp4", ".m3u8", ".ts", ".webm", "/media/", "/video/", "/stream/", "/hls/")
 
 
 def _is_video_url(url: str) -> bool:
@@ -30,17 +34,20 @@ def _is_video_url(url: str) -> bool:
     if not isinstance(url, str) or not url.startswith("http"):
         return False
     low = url.lower().split("?")[0]  # strip query string for ext check
-    # Reject known non-video extensions
+    # Reject known non-video extensions — images always lose even on video CDN domains
     if any(low.endswith(ext) for ext in _NON_VIDEO_EXTS):
         return False
     # Accept if it has a clear video signal
-    if ".m3u8" in low or ".mp4" in low or ".ts" in low or ".webm" in low:
+    if ".m3u8" in low or ".mp4" in low or ".webm" in low:
         return True
-    # Accept if it comes from a known video CDN
-    if any(cdn in url for cdn in _VIDEO_CDN_DOMAINS):
+    # Accept .ts only if it looks like a media segment (not a TypeScript file)
+    if ".ts" in low and any(sig in low for sig in ("/media/", "/hls/", "/stream/", "segment")):
+        return True
+    # Accept if it comes from a known video CDN AND has a video path signature
+    if any(cdn in url for cdn in _VIDEO_CDN_DOMAINS) and any(sig in low for sig in _VIDEO_SIGS):
         return True
     # Accept if path contains video-related keywords (but not JS/CSS paths)
-    if any(kw in low for kw in ["video", "stream", "hls", "play", "media"]):
+    if any(kw in low for kw in ["stream", "hls", "media"]) and not any(low.endswith(ext) for ext in _NON_VIDEO_EXTS):
         return True
     return False
 

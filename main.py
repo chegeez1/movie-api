@@ -1416,6 +1416,78 @@ def _trigger_auto_download(result: dict, ep: int = 1, season: int = 0, skip_play
     ).start()
 
 
+@app.get("/stream-video/{detail_path:path}")
+async def stream_video(
+    request: Request,
+    detail_path: str,
+    ep: int = Query(1),
+    season: int = Query(0),
+):
+    """
+    Stream a locally-downloaded MP4 directly to the browser with HTTP Range support.
+    This lets the browser seek/scrub without re-downloading from the start.
+    No ads — the file is served straight from VPS disk.
+    """
+    cache_key = f"stream:{detail_path}"
+    stream = _cached(cache_key, scraper.get_stream_info, detail_path=detail_path)
+    if not stream:
+        raise HTTPException(status_code=404, detail="Title not found")
+
+    safe_title = _safe_name(stream.get("title", detail_path))[:60]
+    local_path  = _find_local_file(safe_title, ep, season)
+    if not local_path:
+        raise HTTPException(status_code=404, detail="File not on server yet")
+
+    file_size    = os.path.getsize(local_path)
+    range_header = request.headers.get("range")
+
+    common_headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-cache",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length",
+    }
+
+    if range_header:
+        m = re.match(r"bytes=(\d+)-(\d*)", range_header)
+        if m:
+            start = int(m.group(1))
+            end   = int(m.group(2)) if m.group(2) else file_size - 1
+            end   = min(end, file_size - 1)
+            length = end - start + 1
+
+            async def range_iter():
+                with open(local_path, "rb") as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk = f.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                        yield chunk
+
+            return StreamingResponse(
+                range_iter(), status_code=206, media_type="video/mp4",
+                headers={**common_headers,
+                         "Content-Range":  f"bytes {start}-{end}/{file_size}",
+                         "Content-Length": str(length)},
+            )
+
+    async def full_iter():
+        with open(local_path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+
+    return StreamingResponse(
+        full_iter(), status_code=200, media_type="video/mp4",
+        headers={**common_headers, "Content-Length": str(file_size)},
+    )
+
+
 @app.get("/stream/{detail_path:path}")
 async def get_stream(
     detail_path: str,

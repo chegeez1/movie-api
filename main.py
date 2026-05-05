@@ -590,8 +590,48 @@ def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: i
             except Exception as nav_err:
                 print(f"[playwright] nav error (continuing): {nav_err}", file=sys.stderr)
 
-            # Wait up to 20s for a video URL to appear
-            for _ in range(20):
+            # Let Firebase + player JS initialize
+            page.wait_for_timeout(3000)
+
+            # Click the play button — the player won't request the video URL until playback starts
+            play_selectors = [
+                "video",
+                ".play-btn", ".play-button", ".btn-play",
+                "[class*='play']",
+                ".vjs-big-play-button",
+                ".plyr__control--overlaid",
+                ".jw-display-icon-container",
+                ".mejs__overlay-play",
+                "button[aria-label*='play' i]",
+                "button[title*='play' i]",
+            ]
+            clicked = False
+            for sel in play_selectors:
+                try:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        el.click()
+                        print(f"[playwright] Clicked: {sel}", file=sys.stderr)
+                        clicked = True
+                        break
+                except Exception:
+                    pass
+            if not clicked:
+                # Last resort: click body and dispatch a tap event
+                try:
+                    page.evaluate("document.body.click()")
+                    page.evaluate("document.dispatchEvent(new MouseEvent('click', {bubbles:true}))")
+                    # Also try forcing video play via JS
+                    page.evaluate("""
+                        const v = document.querySelector('video');
+                        if (v) { v.muted = true; v.play().catch(()=>{}); }
+                    """)
+                    print(f"[playwright] Used JS click/play fallback", file=sys.stderr)
+                except Exception:
+                    pass
+
+            # Wait up to 25s for a video URL to appear
+            for _ in range(25):
                 page.wait_for_timeout(1000)
                 if captured:
                     break

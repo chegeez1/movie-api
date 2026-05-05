@@ -756,8 +756,8 @@ def _resolve_direct_source(stream: dict, ep: int, season: int, resolution: int) 
             import json as _json
             with _ureq.urlopen(_det_req, timeout=8) as _r:
                 _det = _json.loads(_r.read())
-            _trailer = (_det.get("data") or {}).get("subject", {}).get("trailer", {})
-            _turl = (_trailer.get("videoAddress") or {}).get("url", "")
+            _trailer = ((_det.get("data") or {}).get("subject") or {}).get("trailer") or {}
+            _turl = (_trailer.get("videoAddress") or {}).get("url", "") if isinstance(_trailer, dict) else ""
             if _is_video_url(_turl):
                 print(f"[resolve] detail-trailer: {_turl[:80]}", file=sys.stderr)
                 return _turl, "detail_trailer"

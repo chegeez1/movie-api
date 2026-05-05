@@ -395,23 +395,37 @@ def _find_local_file(safe_title: str, ep: int, season: int) -> Optional[str]:
     Return path to the best matching local file for a title/ep/season,
     or None. Prefers 1080p → 720p → any resolution.
     Files under 50 MB are treated as trailers/corrupt downloads and ignored.
+
+    Season normalisation: the frontend passes season=0 as default for series,
+    but bulk downloads store series as season=1 (s01e01).  When season=0 finds
+    nothing we automatically retry with season=1 so those files are visible.
     """
-    if not os.path.isdir(_DOWNLOAD_DIR):
+    def _search(s: int, e: int) -> Optional[str]:
+        if not os.path.isdir(_DOWNLOAD_DIR):
+            return None
+        prefix = f"{safe_title}_s{s:02d}e{e:02d}_"
+        for res in ("1080p", "720p", "480p", "360p"):
+            candidate = os.path.join(_DOWNLOAD_DIR, f"{prefix}{res}.mp4")
+            if os.path.exists(candidate) and os.path.getsize(candidate) >= _MIN_REAL_FILE_BYTES:
+                return candidate
+        try:
+            for fname in os.listdir(_DOWNLOAD_DIR):
+                if fname.startswith(prefix) and fname.lower().endswith((".mp4", ".mkv", ".webm", ".m4v", ".avi")):
+                    fpath = os.path.join(_DOWNLOAD_DIR, fname)
+                    if os.path.getsize(fpath) >= _MIN_REAL_FILE_BYTES:
+                        return fpath
+        except OSError:
+            pass
         return None
-    prefix = f"{safe_title}_s{season:02d}e{ep:02d}_"
-    for res in ("1080p", "720p", "480p", "360p"):
-        candidate = os.path.join(_DOWNLOAD_DIR, f"{prefix}{res}.mp4")
-        if os.path.exists(candidate) and os.path.getsize(candidate) >= _MIN_REAL_FILE_BYTES:
-            return candidate
-    # Fall back: any file with the prefix (.mp4 or .mkv)
-    try:
-        for fname in os.listdir(_DOWNLOAD_DIR):
-            if fname.startswith(prefix) and fname.lower().endswith((".mp4", ".mkv", ".webm", ".m4v", ".avi")):
-                fpath = os.path.join(_DOWNLOAD_DIR, fname)
-                if os.path.getsize(fpath) >= _MIN_REAL_FILE_BYTES:
-                    return fpath
-    except OSError:
-        pass
+
+    result = _search(season, ep)
+    if result:
+        return result
+    # season=0 is the frontend default; bulk stores series as season=1 — try both
+    if season == 0:
+        return _search(1, ep)
+    if season == 1:
+        return _search(0, ep)
     return None
 
 
@@ -1692,9 +1706,10 @@ def _trigger_auto_download(result: dict, ep: int = 1, season: int = 0, skip_play
     """
     import sys
     is_series = result.get("is_series", False)
-    # For series: queue the specific episode. For movies: ep=1, season=0.
+    # For series: queue ep=1, season=1 (normalise season=0 → 1 to match bulk filenames).
+    # For movies: ep=1, season=0.
     _ep     = ep if is_series else 1
-    _season = season if is_series else 0
+    _season = (max(season, 1) if is_series else 0)
     akey = f"{result.get('imdb_id') or result.get('id') or result.get('title', '')}:{_ep}:{_season}"
     if akey in _auto_queued:
         return

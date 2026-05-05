@@ -504,13 +504,6 @@ class ChegeScraper:
         except Exception as e:
             print(f"[netfilm-html] Error: {e}", file=sys.stderr)
 
-        # 3. Playwright fallback — headless Chromium renders the page, captures XHR responses
-        playwright_result = self._get_video_url_playwright(
-            subject_id, detail_path, ep=ep, season=season, resolution=resolution
-        )
-        if playwright_result:
-            return playwright_result
-
         return None
 
     def _get_video_url_playwright(

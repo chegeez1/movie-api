@@ -848,16 +848,30 @@ def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 
     }
 
     # Early exit: already on disk
-    if _find_local_file(safe_title, ep, season):
+    if existing := _find_local_file(safe_title, ep, season):
         _download_jobs[job_id]["status"] = "skipped_exists"
+        detail_path = stream.get("detail_path", "")
+        if detail_path and detail_path not in _lib_index:
+            try:
+                sz = os.path.getsize(existing) / 1_048_576
+            except OSError:
+                sz = 0
+            _save_lib_entry(detail_path, stream, sz)
         return
 
     # Wait for a download slot
     _download_jobs[job_id]["status"] = "waiting"
     with _dl_semaphore:
         # Re-check inside lock
-        if _find_local_file(safe_title, ep, season):
+        if existing := _find_local_file(safe_title, ep, season):
             _download_jobs[job_id]["status"] = "skipped_exists"
+            detail_path = stream.get("detail_path", "")
+            if detail_path and detail_path not in _lib_index:
+                try:
+                    sz = os.path.getsize(existing) / 1_048_576
+                except OSError:
+                    sz = 0
+                _save_lib_entry(detail_path, stream, sz)
             return
 
         # ── Step 1: try direct sources (BWM / cache / aoneroom) ──────────────

@@ -315,14 +315,14 @@ def _find_local_file(safe_title: str, ep: int, season: int) -> Optional[str]:
     prefix = f"{safe_title}_s{season:02d}e{ep:02d}_"
     for res in ("1080p", "720p", "480p", "360p"):
         candidate = os.path.join(_DOWNLOAD_DIR, f"{prefix}{res}.mp4")
-        if os.path.exists(candidate) and os.path.getsize(candidate) > 50 * 1_048_576:
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 512_000:
             return candidate
     # Fall back: any file with the prefix
     try:
         for fname in os.listdir(_DOWNLOAD_DIR):
             if fname.startswith(prefix) and fname.endswith(".mp4"):
                 fpath = os.path.join(_DOWNLOAD_DIR, fname)
-                if os.path.getsize(fpath) > 50 * 1_048_576:
+                if os.path.getsize(fpath) > 512_000:
                     return fpath
     except OSError:
         pass

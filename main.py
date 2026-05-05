@@ -17,6 +17,7 @@ import re
 import json
 import uuid
 import urllib.parse
+import urllib.request
 import httpx
 
 from chege_scraper import ChegeScraper, _is_video_url
@@ -375,10 +376,10 @@ def _find_local_file(safe_title: str, ep: int, season: int) -> Optional[str]:
         candidate = os.path.join(_DOWNLOAD_DIR, f"{prefix}{res}.mp4")
         if os.path.exists(candidate) and os.path.getsize(candidate) >= _MIN_REAL_FILE_BYTES:
             return candidate
-    # Fall back: any file with the prefix
+    # Fall back: any file with the prefix (.mp4 or .mkv)
     try:
         for fname in os.listdir(_DOWNLOAD_DIR):
-            if fname.startswith(prefix) and fname.endswith(".mp4"):
+            if fname.startswith(prefix) and fname.lower().endswith((".mp4", ".mkv", ".webm", ".m4v", ".avi")):
                 fpath = os.path.join(_DOWNLOAD_DIR, fname)
                 if os.path.getsize(fpath) >= _MIN_REAL_FILE_BYTES:
                     return fpath
@@ -561,6 +562,247 @@ def _embed_urls_for(imdb_id: str, is_series: bool, ep: int, season: int) -> list
             (f"https://2embed.cc/embed/{imdb_id}",                "2embed"),
             (f"https://vidsrc.to/embed/movie/{imdb_id}",          "vidsrc.to"),
         ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Torrentio / aria2c torrent-based download pipeline
+# Uses https://torrentio.strem.fun (public Stremio addon) to get magnet links
+# for any IMDB ID, then downloads via aria2c.  No authentication required.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TORRENTIO_BASE = "https://torrentio.strem.fun"
+_TORRENT_TRACKERS = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.tracker.cl:1337/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://explodie.org:6969/announce",
+    "udp://tracker.dler.org:6969/announce",
+]
+
+
+def _torrentio_best_stream(imdb_id: str, is_series: bool, ep: int, season: int) -> Optional[dict]:
+    """
+    Query Torrentio and return the best available torrent stream dict.
+    Prefers 1080p WEB/BluRay → 1080p any → 720p → smallest 4k.
+    Returns None if no streams found or API unreachable.
+    """
+    import sys
+    if not imdb_id or not imdb_id.startswith("tt"):
+        return None
+
+    if is_series:
+        s = max(season, 1)
+        path = f"stream/series/{imdb_id}%3A{s}%3A{ep}.json"
+    else:
+        path = f"stream/movie/{imdb_id}.json"
+
+    url = f"{_TORRENTIO_BASE}/{path}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())
+    except Exception as exc:
+        print(f"[torrentio] API error for {imdb_id}: {exc}", file=sys.stderr)
+        return None
+
+    streams = data.get("streams", [])
+    if not streams:
+        print(f"[torrentio] No streams for {imdb_id}", file=sys.stderr)
+        return None
+
+    print(f"[torrentio] {len(streams)} streams for {imdb_id}", file=sys.stderr)
+
+    def _quality_rank(s: dict) -> tuple:
+        name  = (s.get("name", "") + " " + s.get("title", "")).lower()
+        # Extract seeder count from title (emoji 👤 N)
+        seeders = 0
+        m = re.search(r"\U0001f464\s*(\d+)", s.get("title", ""))
+        if m:
+            seeders = int(m.group(1))
+        # Extract size in GB from title (emoji 💾 N.NN GB)
+        size_gb = 99.0
+        sm = re.search(r"\U0001f4be\s*([\d.]+)\s*gb", s.get("title", ""), re.IGNORECASE)
+        if sm:
+            size_gb = float(sm.group(1))
+        # Quality tier: 0=1080p, 1=720p, 2=480p, 3=4k, 4=other
+        if "1080p" in name or "1080" in name:
+            tier = 0
+        elif "720p" in name or "720" in name:
+            tier = 1
+        elif "480p" in name or "480" in name:
+            tier = 2
+        elif "2160p" in name or "4k" in name or "uhd" in name:
+            tier = 3
+        else:
+            tier = 4
+        # Within tier: prefer WEB-DL/WEBRip > BluRay > other; prefer more seeders; prefer smaller
+        source_bonus = 0 if any(k in name for k in ("web-dl","webrip","web dl")) else (1 if "bluray" in name or "blu-ray" in name else 2)
+        return (tier, source_bonus, -seeders, size_gb)
+
+    # Filter: must have a valid infoHash
+    valid = [s for s in streams if s.get("infoHash")]
+    if not valid:
+        return None
+
+    best = sorted(valid, key=_quality_rank)[0]
+    q_name = best.get("name", "").replace("\n", " ")
+    print(f"[torrentio] Best: {q_name} — {best.get('infoHash','')[:16]}...", file=sys.stderr)
+    return best
+
+
+def _download_via_torrent(
+    job_id: str,
+    imdb_id: str,
+    is_series: bool,
+    ep: int,
+    season: int,
+    filepath: str,
+    filename: str,
+) -> bool:
+    """
+    Download a movie/episode via torrent using aria2c.
+    1. Queries Torrentio for the best magnet link.
+    2. Runs aria2c to download to a temp dir.
+    3. Finds the largest video file in the result.
+    4. Remuxes .mkv→.mp4 using ffmpeg (no re-encode, fast).
+    5. Moves final file to `filepath`.
+    Returns True on success.
+    """
+    import sys, shutil, glob
+    _ensure_download_dir()
+
+    stream = _torrentio_best_stream(imdb_id, is_series, ep, season)
+    if not stream:
+        return False
+
+    info_hash = stream["infoHash"]
+    dn        = stream.get("behaviorHints", {}).get("filename") or stream.get("name", info_hash)
+    file_idx  = stream.get("fileIdx")  # 0-based; None means single-file torrent
+
+    # Build magnet link with public trackers for faster peer discovery
+    magnet = (
+        f"magnet:?xt=urn:btih:{info_hash}"
+        f"&dn={urllib.parse.quote(str(dn))}"
+        + "".join(f"&tr={urllib.parse.quote(t)}" for t in _TORRENT_TRACKERS)
+    )
+
+    tmp_dir = f"/tmp/chege_torrent_{job_id}"
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    cmd = [
+        "aria2c",
+        "--seed-time=0",          # never seed
+        "--file-allocation=none", # skip pre-allocation for speed
+        "--max-connection-per-server=4",
+        "--enable-dht=true",
+        "--enable-peer-exchange=true",
+        "--bt-enable-lpd=true",
+        f"--dir={tmp_dir}",
+        "--console-log-level=warn",
+        "--summary-interval=30",
+    ]
+    if file_idx is not None:
+        cmd.append(f"--select-file={file_idx + 1}")  # aria2c is 1-based
+
+    cmd.append(magnet)
+
+    print(f"[torrent] {job_id} aria2c infoHash={info_hash[:16]} fileIdx={file_idx}", file=sys.stderr)
+    if job_id in _download_jobs:
+        _download_jobs[job_id]["source"] = "torrentio"
+        _download_jobs[job_id]["status"] = "downloading"
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for line in (proc.stdout or []):
+            line = line.strip()
+            # Parse aria2c progress lines: "[#XXXXXX 1GiB/4GiB(25%) CN:5 DL:2MiB ...]"
+            m = re.search(r"\((\d+)%\)", line)
+            if m and job_id in _download_jobs:
+                _download_jobs[job_id]["progress"] = int(m.group(1))
+        proc.wait()
+    except Exception as exc:
+        print(f"[torrent] {job_id} aria2c error: {exc}", file=sys.stderr)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return False
+
+    # Find largest video file in the temp dir (recursive)
+    VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".webm", ".m4v", ".mov")
+    candidates = []
+    for root, _, files in os.walk(tmp_dir):
+        for f in files:
+            if f.lower().endswith(VIDEO_EXTS):
+                fp = os.path.join(root, f)
+                try:
+                    candidates.append((os.path.getsize(fp), fp))
+                except OSError:
+                    pass
+
+    if not candidates:
+        print(f"[torrent] {job_id} no video files found in {tmp_dir}", file=sys.stderr)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return False
+
+    candidates.sort(reverse=True)
+    src_path = candidates[0][1]
+    src_size = candidates[0][0]
+    print(f"[torrent] {job_id} found {src_path} ({src_size // 1_048_576} MB)", file=sys.stderr)
+
+    if src_size < _MIN_REAL_FILE_BYTES:
+        print(f"[torrent] {job_id} file too small ({src_size // 1_048_576} MB) — skipping", file=sys.stderr)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return False
+
+    # Remux .mkv → .mp4 using ffmpeg (stream copy, no re-encode)
+    if src_path.lower().endswith(".mkv"):
+        out_path = filepath if filepath.endswith(".mp4") else filepath.rsplit(".", 1)[0] + ".mp4"
+        print(f"[torrent] {job_id} remuxing MKV → MP4", file=sys.stderr)
+        try:
+            remux = subprocess.run(
+                ["ffmpeg", "-y", "-i", src_path,
+                 "-c", "copy", "-movflags", "+faststart",
+                 out_path],
+                capture_output=True, timeout=3600,
+            )
+            if remux.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 1_048_576:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                size_mb = os.path.getsize(out_path) // 1_048_576
+                if job_id in _download_jobs:
+                    _download_jobs[job_id].update({"status": "ready", "progress": 100, "size_mb": size_mb})
+                    _bulk_stats["downloaded"] = _bulk_stats.get("downloaded", 0) + 1
+                print(f"[torrent] {job_id} DONE (remuxed) — {size_mb} MB", file=sys.stderr)
+                return True
+            else:
+                err = remux.stderr.decode("utf-8", "ignore")[-200:]
+                print(f"[torrent] {job_id} ffmpeg failed: {err}", file=sys.stderr)
+                # Fall through: try moving the .mkv directly
+        except Exception as exc:
+            print(f"[torrent] {job_id} remux exception: {exc}", file=sys.stderr)
+            # Fall through: move .mkv as-is
+
+    # Move file to final destination (rename to .mp4 even if .mkv — browser handles it)
+    final = filepath if filepath.endswith((".mp4", ".mkv")) else filepath
+    if src_path.lower().endswith(".mkv") and not final.endswith(".mkv"):
+        final = final.rsplit(".", 1)[0] + ".mkv"
+    try:
+        shutil.move(src_path, final)
+    except Exception as exc:
+        print(f"[torrent] {job_id} move error: {exc}", file=sys.stderr)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return False
+
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    size_mb = os.path.getsize(final) // 1_048_576
+    if job_id in _download_jobs:
+        _download_jobs[job_id].update({"status": "ready", "progress": 100, "size_mb": size_mb})
+        _bulk_stats["downloaded"] = _bulk_stats.get("downloaded", 0) + 1
+    print(f"[torrent] {job_id} DONE — {size_mb} MB ({os.path.basename(final)})", file=sys.stderr)
+    return True
 
 
 def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: int, resolution: int) -> Optional[str]:
@@ -867,7 +1109,34 @@ def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 
                 _save_lib_entry(detail_path, stream, sz)
             return
 
-        # ── Step 1: try direct sources (BWM / cache / aoneroom) ──────────────
+        # ── Step 0: Torrentio / aria2c (primary source — no auth required) ──────
+        # Resolve IMDB ID first — get_stream_info does a lookup but bulk mode
+        # calls _trigger_auto_download with the light search result which may
+        # have imdb_id=None.  Attempt scraper lookup if missing.
+        effective_imdb = imdb_id
+        if not effective_imdb:
+            title = stream.get("title", "")
+            year  = (stream.get("release_date") or "")[:4]
+            try:
+                effective_imdb = scraper.lookup_imdb_id(title, year or None, is_series) or ""
+                if effective_imdb:
+                    stream["imdb_id"] = effective_imdb
+                    print(f"[auto-dl] Resolved IMDB: {title} → {effective_imdb}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[auto-dl] IMDB lookup failed for {title}: {exc}", file=sys.stderr)
+
+        if effective_imdb:
+            torrent_ok = _download_via_torrent(
+                job_id, effective_imdb, is_series, ep, season, filepath, filename
+            )
+            if torrent_ok:
+                detail_path = stream.get("detail_path", "")
+                if detail_path:
+                    _save_lib_entry(detail_path, stream, _download_jobs[job_id].get("size_mb", 0))
+                return
+            print(f"[auto-dl] Torrent failed for {filename}, trying direct sources", file=sys.stderr)
+
+        # ── Step 1: try direct sources (BWM / cache / aoneroom / playwright) ──
         direct_url, src_name = _resolve_direct_source(stream, ep, season, resolution, skip_playwright=skip_playwright)
         if direct_url:
             _download_jobs[job_id]["source"] = src_name
@@ -878,16 +1147,16 @@ def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 
                 if detail_path:
                     _save_lib_entry(detail_path, stream, _download_jobs[job_id].get("size_mb", 0))
                 return
-            print(f"[auto-dl] Direct source failed, trying embeds", file=sys.stderr)
+            print(f"[auto-dl] Direct source failed", file=sys.stderr)
 
-        # All direct sources exhausted (stream_meta, cache, BWM, aoneroom, playwright)
+        # All sources exhausted
         subj = stream.get("id", "")
         _download_jobs[job_id].update({
             "status": "error",
-            "error": f"No source found (subject_id={subj}). Install playwright: pip install playwright --break-system-packages && playwright install chromium",
+            "error": f"No source found for {stream.get('title','')} (imdb={effective_imdb or 'none'}, subj={subj})",
         })
         _bulk_stats["dl_errors"] = _bulk_stats.get("dl_errors", 0) + 1
-        print(f"[auto-dl] {filename} — all sources failed", file=sys.stderr)
+        print(f"[auto-dl] {filename} — all sources failed (imdb={effective_imdb or 'none'})", file=sys.stderr)
 
 
 VIDEO_URL_TTL = 7200  # 2 hours

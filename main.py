@@ -254,8 +254,15 @@ def _bulk_process_item(item: dict) -> None:
     is_series  = stream.get("is_series", False)
     ep, season = (1, 1) if is_series else (1, 0)
 
-    if _find_local_file(safe_title, ep, season):
+    if existing := _find_local_file(safe_title, ep, season):
         _bulk_stats["skipped"] += 1
+        # Backfill library index for files that already exist on disk
+        if detail_path not in _lib_index:
+            try:
+                sz = os.path.getsize(existing) / 1_048_576
+            except OSError:
+                sz = 0
+            _save_lib_entry(detail_path, stream, sz)
         return
 
     # skip_playwright=True: bulk mode skips the slow 60s Playwright fallback

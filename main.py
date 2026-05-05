@@ -622,10 +622,35 @@ _TORRENT_TRACKERS = [
 ]
 
 
+_DISK_PAUSE_GB = 20   # stop new downloads when free space drops below this
+
+
+def _free_disk_gb() -> float:
+    """Return free GB on the download partition."""
+    try:
+        st = os.statvfs(_DOWNLOAD_DIR if os.path.isdir(_DOWNLOAD_DIR) else "/")
+        return (st.f_bavail * st.f_frsize) / 1_073_741_824
+    except OSError:
+        return 999.0
+
+
+def _parse_size_gb(stream: dict) -> float:
+    """Extract file size in GB from a Torrentio stream's title field (💾 N.NN GB)."""
+    title = stream.get("title", "")
+    m = re.search(r"\U0001f4be\s*([\d.]+)\s*gb", title, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+    # Also try MB
+    m2 = re.search(r"\U0001f4be\s*([\d.]+)\s*mb", title, re.IGNORECASE)
+    if m2:
+        return float(m2.group(1)) / 1024
+    return 99.0   # unknown size — treat as large
+
+
 def _torrentio_best_stream(imdb_id: str, is_series: bool, ep: int, season: int) -> Optional[dict]:
     """
     Query Torrentio and return the best available torrent stream dict.
-    Prefers 1080p WEB/BluRay → 1080p any → 720p → smallest 4k.
+    Prefers 720p (space-efficient) → 1080p → 480p; caps at 2.5 GB per file.
     Returns None if no streams found or API unreachable.
     """
     import sys
@@ -667,10 +692,11 @@ def _torrentio_best_stream(imdb_id: str, is_series: bool, ep: int, season: int) 
         sm = re.search(r"\U0001f4be\s*([\d.]+)\s*gb", s.get("title", ""), re.IGNORECASE)
         if sm:
             size_gb = float(sm.group(1))
-        # Quality tier: 0=1080p, 1=720p, 2=480p, 3=4k, 4=other
-        if "1080p" in name or "1080" in name:
+        # Quality tier: prefer 720p (good quality, half the size of 1080p)
+        # 0=720p, 1=1080p, 2=480p, 3=4k, 4=other
+        if "720p" in name or "720" in name:
             tier = 0
-        elif "720p" in name or "720" in name:
+        elif "1080p" in name or "1080" in name:
             tier = 1
         elif "480p" in name or "480" in name:
             tier = 2
@@ -687,7 +713,12 @@ def _torrentio_best_stream(imdb_id: str, is_series: bool, ep: int, season: int) 
     if not valid:
         return None
 
-    best = sorted(valid, key=_quality_rank)[0]
+    # Prefer streams under 2.5 GB to conserve disk space; fall back to smallest if all larger
+    _MAX_SIZE_GB = 2.5
+    under_cap = [s for s in valid if _parse_size_gb(s) <= _MAX_SIZE_GB]
+    pool = under_cap if under_cap else sorted(valid, key=_parse_size_gb)
+
+    best = sorted(pool, key=_quality_rank)[0]
     q_name = best.get("name", "").replace("\n", " ")
     print(f"[torrentio] Best: {q_name} — {best.get('infoHash','')[:16]}...", file=sys.stderr)
     return best
@@ -1144,6 +1175,16 @@ def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 
             except OSError:
                 sz = 0
             _save_lib_entry(detail_path, stream, sz)
+        return
+
+    # Guard: pause if disk is nearly full
+    free_gb = _free_disk_gb()
+    if free_gb < _DISK_PAUSE_GB:
+        _download_jobs[job_id].update({
+            "status": "paused_disk_full",
+            "error": f"Disk low: {free_gb:.1f} GB free (need {_DISK_PAUSE_GB} GB)",
+        })
+        print(f"[auto-dl] DISK LOW ({free_gb:.1f} GB free) — pausing {filename}", file=sys.stderr)
         return
 
     # Wait for a download slot

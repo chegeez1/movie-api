@@ -18,7 +18,7 @@ import uuid
 import urllib.parse
 import httpx
 
-from chege_scraper import ChegeScraper
+from chege_scraper import ChegeScraper, _is_video_url
 
 _PREFIX = "/movies-api"
 
@@ -517,10 +517,14 @@ def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: i
     Requires: pip install playwright --break-system-packages && playwright install chromium
     """
     import sys
+    # Systemd service may have a stripped PATH — force the site-packages where playwright lives
+    for _sp in ("/usr/local/lib/python3.12/dist-packages", "/usr/lib/python3/dist-packages"):
+        if _sp not in sys.path:
+            sys.path.insert(0, _sp)
     try:
         from playwright.sync_api import sync_playwright  # type: ignore
-    except ImportError:
-        print("[playwright] Not installed. Run: pip install playwright --break-system-packages && playwright install chromium", file=sys.stderr)
+    except ImportError as _ie:
+        print(f"[playwright] ImportError: {_ie} — sys.path={sys.path[:4]}", file=sys.stderr)
         return None
 
     vkey = f"{subject_id}:{ep}:{season}:{resolution}"

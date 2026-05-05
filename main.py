@@ -191,8 +191,10 @@ _download_jobs: dict = {}
 _auto_queued:   set  = set()
 # Titles where Torrentio returned zero streams — skip on future scans
 _torrent_no_streams: set = set()
-# Limit concurrent background downloads — 8 parallel max
+# Limit concurrent background downloads — 8 parallel max (bulk)
 _dl_semaphore = threading.Semaphore(8)
+# Separate priority slots for user-triggered downloads — always available, not shared with bulk
+_priority_semaphore = threading.Semaphore(3)
 # Limit concurrent Playwright browser sessions — only 1 at a time to avoid crashes
 _playwright_semaphore = threading.Semaphore(1)
 
@@ -1142,11 +1144,11 @@ def _resolve_direct_source(stream: dict, ep: int, season: int, resolution: int, 
     return None, ""
 
 
-def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 1080, skip_playwright: bool = False) -> None:
+def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 1080, skip_playwright: bool = False, priority: bool = False) -> None:
     """
     Background worker: resolve source → download to VPS disk.
     Job is registered in _download_jobs IMMEDIATELY so it's always visible in /library-status.
-    Tries direct sources first, then each embed source in order until one works.
+    priority=True uses the _priority_semaphore (user-triggered) so it never waits behind 8 bulk jobs.
     skip_playwright=True skips the slow Playwright step (used during bulk downloads).
     """
     import sys
@@ -1187,9 +1189,11 @@ def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 
         print(f"[auto-dl] DISK LOW ({free_gb:.1f} GB free) — pausing {filename}", file=sys.stderr)
         return
 
-    # Wait for a download slot
+    # Wait for a download slot — priority jobs use a separate semaphore so they
+    # never queue behind 8 bulk downloads
+    _sem = _priority_semaphore if priority else _dl_semaphore
     _download_jobs[job_id]["status"] = "waiting"
-    with _dl_semaphore:
+    with _sem:
         # Re-check inside lock
         if existing := _find_local_file(safe_title, ep, season):
             _download_jobs[job_id]["status"] = "skipped_exists"
@@ -1739,10 +1743,11 @@ async def popular_searches():
     return {"status": "success", "timestamp": now(), "data": {"searches": result}}
 
 
-def _trigger_auto_download(result: dict, ep: int = 1, season: int = 0, skip_playwright: bool = False) -> None:
+def _trigger_auto_download(result: dict, ep: int = 1, season: int = 0, skip_playwright: bool = False, priority: bool = False) -> None:
     """
     Fire-and-forget: auto-download this title to VPS disk if not already present.
     Key is (imdb_id or title, ep, season) — only queued once per server lifetime.
+    priority=True: user-triggered, uses priority semaphore (won't wait behind 8 bulk jobs).
     skip_playwright=True is used by bulk mode to avoid 60s Playwright timeouts.
     """
     import sys
@@ -1752,18 +1757,20 @@ def _trigger_auto_download(result: dict, ep: int = 1, season: int = 0, skip_play
     _ep     = ep if is_series else 1
     _season = (max(season, 1) if is_series else 0)
     akey = f"{result.get('imdb_id') or result.get('id') or result.get('title', '')}:{_ep}:{_season}"
-    if akey in _auto_queued:
+    # Priority requests always re-queue even if already in bulk queue
+    if not priority and akey in _auto_queued:
         return
     safe_title = _safe_name(result.get("title", "unknown"))[:60]
     if _find_local_file(safe_title, _ep, _season):
         _auto_queued.add(akey)
         return
     _auto_queued.add(akey)
-    print(f"[auto-dl] Queuing background download: {result.get('title')} s{_season}e{_ep}", file=sys.stderr)
+    tag = "[priority-dl]" if priority else "[auto-dl]"
+    print(f"{tag} Queuing download: {result.get('title')} s{_season}e{_ep}", file=sys.stderr)
     threading.Thread(
         target=_auto_download_worker,
         args=(result, _ep, _season),
-        kwargs={"skip_playwright": skip_playwright},
+        kwargs={"skip_playwright": skip_playwright, "priority": priority},
         daemon=True,
     ).start()
 
@@ -2312,8 +2319,8 @@ async def download_info(
             "local": True,
         }
 
-    # Not on disk yet — silently queue background download so it'll be ready next time
-    _trigger_auto_download(stream, ep=ep, season=season, skip_playwright=True)
+    # Not on disk yet — queue as PRIORITY so it jumps ahead of bulk background downloads
+    _trigger_auto_download(stream, ep=ep, season=season, skip_playwright=True, priority=True)
 
     # 1. BWM / GiftedTech — direct MP4 URLs, multiple qualities, no conversion needed
     if subject_id:

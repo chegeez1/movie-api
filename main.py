@@ -255,6 +255,9 @@ def _ensure_download_dir() -> None:
     os.makedirs(_DOWNLOAD_DIR, exist_ok=True)
 
 
+# Bulk download year gate — skip titles released before this year to save disk space
+_BULK_MIN_YEAR = 2010
+
 def _bulk_process_item(item: dict) -> None:
     """Try to queue a download for a single scraped item (movie or episode 1 of series)."""
     global _bulk_stats
@@ -262,6 +265,16 @@ def _bulk_process_item(item: dict) -> None:
 
     detail_path = item.get("detail_path") or item.get("detailPath", "")
     if not detail_path:
+        _bulk_stats["skipped"] += 1
+        return
+
+    # Year gate: skip anything older than _BULK_MIN_YEAR to save storage
+    raw_date = item.get("release_date") or item.get("releaseDate") or ""
+    try:
+        year = int(str(raw_date)[:4])
+    except (ValueError, TypeError):
+        year = 9999  # unknown year → allow through
+    if year < _BULK_MIN_YEAR:
         _bulk_stats["skipped"] += 1
         return
 
@@ -344,6 +357,12 @@ def _bulk_download_all(
             items = result.get("items", [])
             if not items:
                 break
+            # Sort newest-first within each page so latest content downloads first
+            items = sorted(
+                items,
+                key=lambda x: (x.get("release_date") or x.get("releaseDate") or "0000"),
+                reverse=True,
+            )
             for item in items:
                 if _bulk_stop:
                     return

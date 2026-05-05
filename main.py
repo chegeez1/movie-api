@@ -138,7 +138,7 @@ app.add_middleware(
 )
 
 
-def _start_bulk_and_schedule(max_pages: int = 500, concurrency: int = 3) -> None:
+def _start_bulk_and_schedule(max_pages: int = 500, concurrency: int = 8) -> None:
     """
     Start the bulk downloader if not already running, then after it finishes
     wait 6 hours and re-run automatically to catch newly added movies.
@@ -189,8 +189,10 @@ _LIBRARY_INDEX_FILE = os.path.join(_DOWNLOAD_DIR, ".library_index.json")
 _download_jobs: dict = {}
 # Keys already auto-queued so we don't re-fire on every page refresh
 _auto_queued:   set  = set()
-# Limit concurrent background downloads — 3 parallel max
-_dl_semaphore = threading.Semaphore(3)
+# Titles where Torrentio returned zero streams — skip on future scans
+_torrent_no_streams: set = set()
+# Limit concurrent background downloads — 8 parallel max
+_dl_semaphore = threading.Semaphore(8)
 # Limit concurrent Playwright browser sessions — only 1 at a time to avoid crashes
 _playwright_semaphore = threading.Semaphore(1)
 
@@ -347,11 +349,11 @@ def _bulk_download_all(
                     _bulk_stats["skipped"] += 1
                     continue
                 _bulk_process_item(item)
-                time.sleep(0.4)   # gentle throttle — don't hammer the origin
+                time.sleep(0.1)   # light throttle — don't hammer the origin
             if not result.get("pager", {}).get("hasMore", False):
                 print(f"[bulk-dl] {source_name} exhausted at page {page}", file=sys.stderr)
                 break
-            time.sleep(1.5)   # pause between pages
+            time.sleep(0.3)   # pause between pages
 
     try:
         # ── 1. All movies ────────────────────────────────────────────────────
@@ -634,6 +636,7 @@ def _torrentio_best_stream(imdb_id: str, is_series: bool, ep: int, season: int) 
     streams = data.get("streams", [])
     if not streams:
         print(f"[torrentio] No streams for {imdb_id}", file=sys.stderr)
+        _torrent_no_streams.add(imdb_id)   # remember — skip on future scans
         return None
 
     print(f"[torrentio] {len(streams)} streams for {imdb_id}", file=sys.stderr)
@@ -717,15 +720,25 @@ def _download_via_torrent(
 
     cmd = [
         "aria2c",
-        "--seed-time=0",          # never seed
-        "--file-allocation=none", # skip pre-allocation for speed
-        "--max-connection-per-server=4",
+        "--seed-time=0",            # never seed
+        "--file-allocation=none",   # skip pre-allocation for speed
+        "--max-connection-per-server=8",
+        "--split=16",               # 16 parallel chunks per file
+        "--min-split-size=5M",
         "--enable-dht=true",
         "--enable-peer-exchange=true",
         "--bt-enable-lpd=true",
+        "--bt-max-peers=100",       # more peers = faster on hot torrents
+        "--bt-request-peer-speed-limit=0",  # no per-peer limit
+        "--max-overall-download-limit=0",   # unlimited download speed
         f"--dir={tmp_dir}",
         "--console-log-level=warn",
-        "--summary-interval=30",
+        "--summary-interval=60",
+        "--timeout=120",
+        "--connect-timeout=30",
+        "--retry-wait=5",
+        "--max-tries=3",
+        "--bt-stop-timeout=600",    # give up on stalled torrent after 10 min
     ]
     if file_idx is not None:
         cmd.append(f"--select-file={file_idx + 1}")  # aria2c is 1-based
@@ -1149,6 +1162,10 @@ def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 
                     print(f"[auto-dl] Resolved IMDB: {title} → {effective_imdb}", file=sys.stderr)
             except Exception as exc:
                 print(f"[auto-dl] IMDB lookup failed for {title}: {exc}", file=sys.stderr)
+
+        if effective_imdb and effective_imdb in _torrent_no_streams:
+            print(f"[auto-dl] Skipping {filename} — Torrentio previously returned 0 streams for {effective_imdb}", file=sys.stderr)
+            effective_imdb = ""   # fall through to direct sources
 
         if effective_imdb:
             torrent_ok = _download_via_torrent(

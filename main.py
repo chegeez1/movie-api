@@ -502,42 +502,107 @@ def _embed_urls_for(imdb_id: str, is_series: bool, ep: int, season: int) -> list
         ]
 
 
+def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: int, resolution: int) -> Optional[str]:
+    """
+    Load our OWN local proxy player page with headless Chromium.
+    The proxy page executes the video player JS, which makes API calls back through
+    our proxy. Our proxy's passive capture stores the CDN video URL into _video_url_cache.
+    We then read that URL and return it.
+
+    This is the most reliable method because:
+    - We load our own server (localhost) — no bot-detection issues
+    - Our proxy already handles URL capture (line ~2020 in this file)
+    - No need for response interception; we just check _video_url_cache after JS runs
+
+    Requires: pip install playwright --break-system-packages && playwright install chromium
+    """
+    import sys
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except ImportError:
+        print("[playwright] Not installed. Run: pip install playwright --break-system-packages && playwright install chromium", file=sys.stderr)
+        return None
+
+    vkey = f"{subject_id}:{ep}:{season}:{resolution}"
+    # Already in cache from a prior run?
+    prior = _video_url_cache.get(vkey)
+    if prior and time.time() - prior.get("ts", 0) < VIDEO_URL_TTL:
+        return prior["url"]
+
+    # Load through our own proxy so URL capture happens automatically
+    proxy_url = (
+        f"http://localhost:5000/proxy/player/movies/{detail_path}"
+        f"?id={subject_id}&ep={ep}&resolution={resolution}"
+    )
+    if season:
+        proxy_url += f"&se={season}"
+
+    print(f"[playwright] Loading local proxy: {proxy_url[:120]}", file=sys.stderr)
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                      "--disable-setuid-sandbox"],
+            )
+            page = browser.new_page()
+            try:
+                page.goto(proxy_url, timeout=30_000, wait_until="domcontentloaded")
+            except Exception as nav_err:
+                print(f"[playwright] nav error (continuing): {nav_err}", file=sys.stderr)
+
+            # Wait up to 20s for proxy to capture the video URL
+            for _ in range(20):
+                page.wait_for_timeout(1000)
+                cached = _video_url_cache.get(vkey)
+                if cached and time.time() - cached.get("ts", 0) < 60:
+                    print(f"[playwright] Cache hit after JS: {cached['url'][:80]}", file=sys.stderr)
+                    browser.close()
+                    return cached["url"]
+
+            browser.close()
+    except Exception as exc:
+        print(f"[playwright] Error: {exc}", file=sys.stderr)
+
+    print(f"[playwright] No URL captured for {detail_path}", file=sys.stderr)
+    return None
+
+
 def _resolve_direct_source(stream: dict, ep: int, season: int, resolution: int) -> tuple[Optional[str], str]:
     """
-    Try all direct sources (no embed page scraping needed):
-      found_video_urls → passive_cache → BWM → aoneroom API → netfilm.world
-    Returns (url, source_name) or (None, "").
+    Try all direct sources in order. Returns (url, source_name) or (None, "").
 
-    _found_video_urls: direct CDN URLs already embedded in stream metadata — completely free.
+    Order:
+      stream_meta  → passive_cache → BWM → aoneroom API
+      → Playwright (loads local proxy, triggers JS, proxy captures CDN URL)
     """
     import sys
     subject_id  = stream.get("id", "")
     title       = stream.get("title", "")
     detail_path = stream.get("detail_path", "")
 
-    # 0. Direct CDN URLs already in the stream info response (aoneroom CDN — best source)
+    # 0. Direct CDN URLs already embedded in stream metadata
     found = stream.get("_found_video_urls", [])
     if found:
-        # Find best match for this ep/season, then fall back to any URL
         matches = [u for u in found if u.get("ep") == ep and u.get("season") == season]
         if not matches:
-            matches = found  # take any URL from the title
+            matches = found
         if matches:
-            # Pick closest resolution
             best = min(matches, key=lambda u: abs(u.get("resolution", 0) - resolution))
             url = best.get("url", "")
             if _is_video_url(url):
-                print(f"[resolve] found_video_url hit for {title!r}: {url[:80]}", file=sys.stderr)
+                print(f"[resolve] stream_meta hit: {url[:80]}", file=sys.stderr)
                 return url, "stream_meta"
 
-    # 1. Passive capture cache (someone already streamed this title)
+    # 1. Passive capture cache (populated when users stream OR by playwright below)
     if subject_id:
         vkey = f"{subject_id}:{ep}:{season}:{resolution}"
         cached = _video_url_cache.get(vkey)
         if cached and time.time() - cached.get("ts", 0) < VIDEO_URL_TTL:
             return cached["url"], "passive_cache"
 
-    # 2. BWM direct MP4
+    # 2. BWM direct MP4 (third-party index of direct download URLs)
     if subject_id:
         try:
             bwm = scraper.get_video_sources_bwm(subject_id, ep=ep, season=season, title=title)
@@ -550,30 +615,20 @@ def _resolve_direct_source(stream: dict, ep: int, season: int, resolution: int) 
         except Exception as exc:
             print(f"[resolve] BWM: {exc}", file=sys.stderr)
 
-    # 3. Aoneroom API (direct endpoints)
+    # 3. Aoneroom API (direct — works for some titles when auth passes)
     if subject_id:
         try:
             ao = scraper.get_video_url(subject_id, ep=ep, season=season, resolution=resolution)
             if ao and _is_video_url(ao.get("url", "")):
                 return ao["url"], "aoneroom"
-            elif ao:
-                print(f"[resolve] aoneroom REJECTED URL: {ao.get('url','')[:80]}", file=sys.stderr)
         except Exception as exc:
             print(f"[resolve] aoneroom: {exc}", file=sys.stderr)
 
-    # 4. netfilm.world — internal API + HTML scrape of the player page
-    if subject_id:
-        try:
-            nf = scraper.get_video_url_from_netfilm(
-                subject_id, detail_path=detail_path, ep=ep, season=season, resolution=resolution
-            )
-            if nf and _is_video_url(nf.get("url", "")):
-                print(f"[resolve] netfilm hit for {title!r}", file=sys.stderr)
-                return nf["url"], "netfilm"
-            elif nf:
-                print(f"[resolve] netfilm REJECTED URL: {nf.get('url','')[:80]}", file=sys.stderr)
-        except Exception as exc:
-            print(f"[resolve] netfilm: {exc}", file=sys.stderr)
+    # 4. Playwright — loads local proxy, JS runs, proxy captures CDN URL
+    if subject_id and detail_path:
+        url = _playwright_warm_cache(subject_id, detail_path, ep, season, resolution)
+        if url and _is_video_url(url):
+            return url, "playwright"
 
     return None, ""
 
@@ -623,42 +678,14 @@ def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 
                 return
             print(f"[auto-dl] Direct source failed, trying embeds", file=sys.stderr)
 
-        # ── Step 2: try embed sources in order until one works ───────────────
-        if not (imdb_id and imdb_id.startswith("tt")):
-            if _download_jobs[job_id]["status"] != "ready":
-                msg = f"No IMDB ID — cannot try embed sources (subject_id={stream.get('id','')})"
-                _download_jobs[job_id].update({"status": "error", "error": msg})
-                _bulk_stats["dl_errors"] = _bulk_stats.get("dl_errors", 0) + 1
-            return
-
-        last_err = ""
-        for embed_url, embed_src in _embed_urls_for(imdb_id, is_series, ep, season):
-            if _find_local_file(safe_title, ep, season):
-                _download_jobs[job_id]["status"] = "ready"
-                return
-            _download_jobs[job_id]["source"] = embed_src
-            _download_jobs[job_id]["progress"] = 0
-            print(f"[auto-dl] {filename} trying embed: {embed_src}", file=sys.stderr)
-            ok, err = _download_via_ytdlp(job_id, embed_url, filepath)
-            if ok and os.path.exists(filepath) and os.path.getsize(filepath) > 10 * 1_048_576:
-                size_mb = os.path.getsize(filepath) // 1_048_576
-                _download_jobs[job_id].update({"status": "ready", "progress": 100, "size_mb": size_mb})
-                _bulk_stats["downloaded"] = _bulk_stats.get("downloaded", 0) + 1
-                print(f"[auto-dl] {filename} DONE via {embed_src} — {size_mb} MB", file=sys.stderr)
-                return
-            last_err = f"{embed_src}: {err}"
-            print(f"[auto-dl] {embed_src} failed: {err}", file=sys.stderr)
-            # Clean up partial file before next attempt
-            try:
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-            except OSError:
-                pass
-
-        # All sources exhausted
-        _download_jobs[job_id].update({"status": "error", "error": f"All sources failed. Last: {last_err}"})
+        # All direct sources exhausted (stream_meta, cache, BWM, aoneroom, playwright)
+        subj = stream.get("id", "")
+        _download_jobs[job_id].update({
+            "status": "error",
+            "error": f"No source found (subject_id={subj}). Install playwright: pip install playwright --break-system-packages && playwright install chromium",
+        })
         _bulk_stats["dl_errors"] = _bulk_stats.get("dl_errors", 0) + 1
-        print(f"[auto-dl] {filename} — all embed sources failed", file=sys.stderr)
+        print(f"[auto-dl] {filename} — all sources failed", file=sys.stderr)
 
 
 VIDEO_URL_TTL = 7200  # 2 hours

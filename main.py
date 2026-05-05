@@ -544,10 +544,13 @@ def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: i
         """Intercept every network response the browser receives."""
         try:
             url = response.url
+            # Never capture localhost/proxy URLs — those are our own rewritten pages, not real CDN streams
+            if "localhost" in url or "127.0.0.1" in url:
+                return
             # Direct video URL in the request itself (CDN hit)
             if _is_video_url(url) and url not in [c.get("url") for c in captured]:
                 vtype = "m3u8" if ".m3u8" in url else "mp4"
-                print(f"[playwright] CDN URL in request: {url[:100]}", file=sys.stderr)
+                print(f"[playwright] CDN direct: {url}", file=sys.stderr)
                 captured.append({"url": url, "type": vtype})
                 return
             # JSON API response — look for video URL inside the body
@@ -555,14 +558,20 @@ def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: i
             if "application/json" in ct and response.status == 200:
                 try:
                     data = response.json()
+                    print(f"[playwright] JSON from {url[:80]}: keys={list(data.keys()) if isinstance(data, dict) else type(data).__name__}", file=sys.stderr)
                     result = scraper._extract_video_url_from_json(data)
-                    if result and result["url"] not in [c.get("url") for c in captured]:
-                        print(f"[playwright] Video URL from JSON ({url[:60]}): {result['url'][:80]}", file=sys.stderr)
-                        captured.append(result)
-                        # Also write into cache so proxy benefits future requests
-                        _video_url_cache[vkey] = {**result, "ts": time.time()}
-                except Exception:
-                    pass
+                    if result:
+                        found_url = result.get("url", "")
+                        # Double-check: reject localhost/proxy URLs from JSON bodies too
+                        if "localhost" in found_url or "127.0.0.1" in found_url:
+                            print(f"[playwright] Skipping proxy URL from JSON: {found_url[:80]}", file=sys.stderr)
+                            return
+                        if found_url not in [c.get("url") for c in captured]:
+                            print(f"[playwright] Video URL from JSON: {found_url}", file=sys.stderr)
+                            captured.append(result)
+                            _video_url_cache[vkey] = {**result, "ts": time.time()}
+                except Exception as je:
+                    print(f"[playwright] JSON parse error {url[:60]}: {je}", file=sys.stderr)
         except Exception:
             pass
 

@@ -1697,6 +1697,70 @@ async def local_library():
     }
 
 
+@app.get("/local-library-movies")
+async def local_library_movies(limit: int = Query(500)):
+    """
+    Return downloaded titles as Movie objects by cross-referencing the stream cache.
+    Only titles whose stream data is cached (populated during bulk download) are returned.
+    """
+    import re as _re
+    _ensure_download_dir()
+
+    # Build safe_title → size_mb map from disk
+    downloaded: dict[str, float] = {}
+    if os.path.isdir(_DOWNLOAD_DIR):
+        for fname in os.listdir(_DOWNLOAD_DIR):
+            if not fname.endswith(".mp4"):
+                continue
+            stem = fname[:-4]
+            # Strip _###p resolution suffix
+            p = stem.rsplit("_", 1)
+            if len(p) == 2 and p[1].endswith("p") and p[1][:-1].isdigit():
+                stem = p[0]
+            # Strip _s##e## suffix
+            m = _re.search(r"_s\d{2}e\d{2}$", stem)
+            if m:
+                stem = stem[: m.start()]
+            try:
+                sz = os.path.getsize(os.path.join(_DOWNLOAD_DIR, fname)) / 1_048_576
+            except OSError:
+                sz = 0
+            downloaded[stem] = sz
+
+    # Cross-reference with stream cache
+    movies = []
+    seen: set = set()
+    for key, entry in list(_cache.items()):
+        if not key.startswith("stream:"):
+            continue
+        s = (entry.get("data") or {})
+        if not s:
+            continue
+        detail_path = s.get("detail_path", "") or key[7:]
+        title = s.get("title", "")
+        safe = _safe_name(title)[:60]
+        if safe in downloaded and detail_path not in seen:
+            seen.add(detail_path)
+            movies.append({
+                "id":          s.get("id", ""),
+                "detail_path": detail_path,
+                "title":       title,
+                "type":        "series" if s.get("is_series") else "movie",
+                "year":        (s.get("release_date") or "")[:4],
+                "imdb_rating": s.get("imdb_rating"),
+                "poster_url":  s.get("cover_url"),
+                "size_mb":     round(downloaded.get(safe, 0), 1),
+            })
+
+    movies.sort(key=lambda x: x["title"].lower())
+    return {
+        "status": "success",
+        "count":  len(movies),
+        "total":  len(downloaded),
+        "data":   {"movies": movies[:limit]},
+    }
+
+
 @app.get("/download-info/{detail_path:path}")
 async def download_info(
     detail_path: str,

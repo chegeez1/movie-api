@@ -1883,7 +1883,23 @@ async def prepare_download(
             source_url = best["url"]
             print(f"[prepare-dl] Source: bwm ({best['quality']})", file=sys.stderr)
 
-    # 3. vidsrc.to embed — yt-dlp will extract + download in one shot
+    # 3. Torrentio / aria2c (no auth, no geo-block, real 1080p)
+    if not source_url and imdb_id and imdb_id.startswith("tt"):
+        job_id = str(uuid.uuid4())[:8]
+        _download_jobs[job_id] = {
+            "status": "queued", "progress": 0,
+            "filepath": filepath, "filename": filename,
+            "ts": time.time(),
+        }
+        def _torrent_worker():
+            ok = _download_via_torrent(job_id, imdb_id, is_series, ep, season, filepath, filename)
+            if not ok:
+                _download_jobs[job_id].update({"status": "error", "error": "Torrent download failed"})
+        threading.Thread(target=_torrent_worker, daemon=True).start()
+        print(f"[prepare-dl] Source: torrentio (imdb={imdb_id})", file=sys.stderr)
+        return {"job_id": job_id, "status": "queued"}
+
+    # 4. vidsrc.to embed — yt-dlp will extract + download in one shot
     if not source_url and imdb_id and imdb_id.startswith("tt"):
         s = max(season, 1)
         if is_series:

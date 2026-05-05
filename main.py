@@ -504,19 +504,16 @@ def _embed_urls_for(imdb_id: str, is_series: bool, ep: int, season: int) -> list
 
 def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: int, resolution: int) -> Optional[str]:
     """
-    Load our OWN local proxy player page with headless Chromium.
-    The proxy page executes the video player JS, which makes API calls back through
-    our proxy. Our proxy's passive capture stores the CDN video URL into _video_url_cache.
-    We then read that URL and return it.
+    Load the player page with headless Chromium and intercept ALL network responses.
 
-    This is the most reliable method because:
-    - We load our own server (localhost) — no bot-detection issues
-    - Our proxy already handles URL capture (line ~2020 in this file)
-    - No need for response interception; we just check _video_url_cache after JS runs
+    Why response interception (not proxy cache):
+      The netfilm.world player JS calls h5-api.aoneroom.com DIRECTLY — those requests
+      never pass through our proxy, so proxy capture never fires. Playwright sits in the
+      middle of the browser's network stack and can see every response regardless of origin.
 
     Requires: pip install playwright --break-system-packages && playwright install chromium
     """
-    import sys
+    import sys, json as _json
     # Systemd service may have a stripped PATH — force the site-packages where playwright lives
     for _sp in ("/usr/local/lib/python3.12/dist-packages", "/usr/lib/python3/dist-packages"):
         if _sp not in sys.path:
@@ -528,12 +525,11 @@ def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: i
         return None
 
     vkey = f"{subject_id}:{ep}:{season}:{resolution}"
-    # Already in cache from a prior run?
     prior = _video_url_cache.get(vkey)
     if prior and time.time() - prior.get("ts", 0) < VIDEO_URL_TTL:
         return prior["url"]
 
-    # Load through our own proxy so URL capture happens automatically
+    # Load through our proxy (rewrites netfilm.world URLs back to localhost)
     proxy_url = (
         f"http://localhost:5000/proxy/player/movies/{detail_path}"
         f"?id={subject_id}&ep={ep}&resolution={resolution}"
@@ -541,7 +537,34 @@ def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: i
     if season:
         proxy_url += f"&se={season}"
 
-    print(f"[playwright] Loading local proxy: {proxy_url[:120]}", file=sys.stderr)
+    print(f"[playwright] Loading: {proxy_url[:120]}", file=sys.stderr)
+    captured: list = []
+
+    def _on_response(response):
+        """Intercept every network response the browser receives."""
+        try:
+            url = response.url
+            # Direct video URL in the request itself (CDN hit)
+            if _is_video_url(url) and url not in [c.get("url") for c in captured]:
+                vtype = "m3u8" if ".m3u8" in url else "mp4"
+                print(f"[playwright] CDN URL in request: {url[:100]}", file=sys.stderr)
+                captured.append({"url": url, "type": vtype})
+                return
+            # JSON API response — look for video URL inside the body
+            ct = response.headers.get("content-type", "")
+            if "application/json" in ct and response.status == 200:
+                try:
+                    data = response.json()
+                    result = scraper._extract_video_url_from_json(data)
+                    if result and result["url"] not in [c.get("url") for c in captured]:
+                        print(f"[playwright] Video URL from JSON ({url[:60]}): {result['url'][:80]}", file=sys.stderr)
+                        captured.append(result)
+                        # Also write into cache so proxy benefits future requests
+                        _video_url_cache[vkey] = {**result, "ts": time.time()}
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     try:
         with sync_playwright() as pw:
@@ -551,23 +574,31 @@ def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: i
                       "--disable-setuid-sandbox"],
             )
             page = browser.new_page()
+            page.on("response", _on_response)
+
             try:
                 page.goto(proxy_url, timeout=30_000, wait_until="domcontentloaded")
             except Exception as nav_err:
                 print(f"[playwright] nav error (continuing): {nav_err}", file=sys.stderr)
 
-            # Wait up to 20s for proxy to capture the video URL
+            # Wait up to 20s for a video URL to appear
             for _ in range(20):
                 page.wait_for_timeout(1000)
-                cached = _video_url_cache.get(vkey)
-                if cached and time.time() - cached.get("ts", 0) < 60:
-                    print(f"[playwright] Cache hit after JS: {cached['url'][:80]}", file=sys.stderr)
-                    browser.close()
-                    return cached["url"]
+                if captured:
+                    break
 
             browser.close()
     except Exception as exc:
         print(f"[playwright] Error: {exc}", file=sys.stderr)
+        return None
+
+    if captured:
+        best = next((c for c in captured if c.get("type") == "m3u8"), captured[0])
+        url = best.get("url", "")
+        if _is_video_url(url):
+            print(f"[playwright] SUCCESS: {url[:100]}", file=sys.stderr)
+            _video_url_cache[vkey] = {**best, "ts": time.time()}
+            return url
 
     print(f"[playwright] No URL captured for {detail_path}", file=sys.stderr)
     return None

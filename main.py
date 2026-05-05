@@ -562,6 +562,10 @@ def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: i
             # JSON API response — look for video URL inside the body
             ct = response.headers.get("content-type", "")
             if "application/json" in ct and response.status == 200:
+                # Skip ad/config endpoints — they embed a generic placeholder clip, not real content
+                _AD_SKIP = ("ad/get-config", "ad-config", "advertisement", "/ads/", "adscenes")
+                if any(skip in url.lower() for skip in _AD_SKIP):
+                    return
                 try:
                     data = response.json()
                     print(f"[playwright] JSON from {url[:80]}: keys={list(data.keys()) if isinstance(data, dict) else type(data).__name__}", file=sys.stderr)
@@ -575,7 +579,7 @@ def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: i
                         if found_url not in [c.get("url") for c in captured]:
                             print(f"[playwright] Video URL from JSON: {found_url}", file=sys.stderr)
                             captured.append(result)
-                            _video_url_cache[vkey] = {**result, "ts": time.time()}
+                            # NOTE: do NOT write to _video_url_cache here — wait until best URL is chosen
                 except Exception as je:
                     print(f"[playwright] JSON parse error {url[:60]}: {je}", file=sys.stderr)
         except Exception:

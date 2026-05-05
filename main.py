@@ -529,15 +529,16 @@ def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: i
     if prior and time.time() - prior.get("ts", 0) < VIDEO_URL_TTL:
         return prior["url"]
 
-    # Load through our proxy (rewrites netfilm.world URLs back to localhost)
-    proxy_url = (
-        f"http://localhost:5000/proxy/player/movies/{detail_path}"
+    # Load netfilm.world DIRECTLY over HTTPS — Firebase auth silently fails over plain HTTP
+    # (proxy is HTTP localhost which breaks Firebase's secure context requirement)
+    page_url = (
+        f"https://netfilm.world/movies/{detail_path}"
         f"?id={subject_id}&ep={ep}&resolution={resolution}"
     )
     if season:
-        proxy_url += f"&se={season}"
+        page_url += f"&se={season}"
 
-    print(f"[playwright] Loading: {proxy_url[:120]}", file=sys.stderr)
+    print(f"[playwright] Loading direct: {page_url[:120]}", file=sys.stderr)
     captured: list = []
 
     def _on_response(response):

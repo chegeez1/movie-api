@@ -163,6 +163,8 @@ _download_jobs: dict = {}
 _auto_queued:   set  = set()
 # Limit concurrent background downloads — 3 parallel max
 _dl_semaphore = threading.Semaphore(3)
+# Limit concurrent Playwright browser sessions — only 1 at a time to avoid crashes
+_playwright_semaphore = threading.Semaphore(1)
 
 # ── Bulk library builder state ────────────────────────────────────────────────
 _bulk_active  = False          # True while bulk builder is running
@@ -464,11 +466,11 @@ def _run_download_job(
         success, err_msg = _download_via_ytdlp(job_id, source_url, filepath)
 
     if success:
-        # Verify size gate (>10 MB = real content, not an error page)
+        # Verify size gate: >500 KB = real content (trailers are 1-30 MB; error pages are <50 KB)
         size = os.path.getsize(filepath)
-        if size < 10 * 1_048_576:
+        if size < 512_000:
             os.remove(filepath)
-            _download_jobs[job_id].update({"status": "error", "error": f"File too small ({size//1024} KB) — likely a promo/error"})
+            _download_jobs[job_id].update({"status": "error", "error": f"File too small ({size//1024} KB) — likely an error page"})
             print(f"[dl-job] {job_id} SIZE-GATE: {size//1024} KB — deleted", file=sys.stderr)
         else:
             size_mb = size // 1_048_576
@@ -739,9 +741,34 @@ def _resolve_direct_source(stream: dict, ep: int, season: int, resolution: int) 
         except Exception as exc:
             print(f"[resolve] aoneroom: {exc}", file=sys.stderr)
 
-    # 4. Playwright — loads local proxy, JS runs, proxy captures CDN URL
+    # 3b. Aoneroom detail endpoint — trailer URL (unique per title, geo-unrestricted)
+    #     Falls back to this when subject/play is geo-blocked. Trailers are real content (1-30MB).
+    if detail_path:
+        try:
+            import urllib.request as _ureq
+            _det_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/detail?detailPath={detail_path}"
+            _det_req = _ureq.Request(_det_url, headers={
+                "Referer": "https://netfilm.world/",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "x-client-info": '{"timezone":"UTC"}',
+                "Accept": "application/json",
+            })
+            import json as _json
+            with _ureq.urlopen(_det_req, timeout=8) as _r:
+                _det = _json.loads(_r.read())
+            _trailer = (_det.get("data") or {}).get("subject", {}).get("trailer", {})
+            _turl = (_trailer.get("videoAddress") or {}).get("url", "")
+            if _is_video_url(_turl):
+                print(f"[resolve] detail-trailer: {_turl[:80]}", file=sys.stderr)
+                return _turl, "detail_trailer"
+        except Exception as exc:
+            print(f"[resolve] detail-trailer: {exc}", file=sys.stderr)
+
+    # 4. Playwright — loads the player page, intercepts JSON, captures CDN URL
+    #    Semaphore ensures only one browser at a time to prevent crashes.
     if subject_id and detail_path:
-        url = _playwright_warm_cache(subject_id, detail_path, ep, season, resolution)
+        with _playwright_semaphore:
+            url = _playwright_warm_cache(subject_id, detail_path, ep, season, resolution)
         if url and _is_video_url(url):
             return url, "playwright"
 

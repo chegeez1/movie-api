@@ -138,9 +138,34 @@ app.add_middleware(
 )
 
 
+def _start_bulk_and_schedule(max_pages: int = 500, concurrency: int = 3) -> None:
+    """
+    Start the bulk downloader if not already running, then after it finishes
+    wait 6 hours and re-run automatically to catch newly added movies.
+    Call this once at startup; it self-perpetuates forever.
+    """
+    global _bulk_active, _bulk_stop
+    if _bulk_active:
+        return
+    _bulk_stop = False
+
+    def _run_loop():
+        while True:
+            _bulk_download_all(max_pages=max_pages, include_series=True, concurrency=concurrency)
+            print("[bulk-dl] Scan complete. Sleeping 6 h before next scan for new movies.", file=sys.stderr)
+            # Clear queued set so re-scan can detect titles added since last run
+            _auto_queued.clear()
+            time.sleep(6 * 3600)
+
+    threading.Thread(target=_run_loop, daemon=True).start()
+
+
 @app.on_event("startup")
 async def startup_event():
     threading.Thread(target=_warm_cache, daemon=True).start()
+    # Auto-start bulk library builder — downloads every MovieBox title to VPS disk,
+    # then re-scans every 6 hours to catch newly added movies.
+    threading.Thread(target=_start_bulk_and_schedule, daemon=True).start()
 
 
 scraper = ChegeScraper()
@@ -2213,6 +2238,9 @@ async def download_info(
             "needs_conversion": False,
             "local": True,
         }
+
+    # Not on disk yet — silently queue background download so it'll be ready next time
+    _trigger_auto_download(stream, ep=ep, season=season, skip_playwright=True)
 
     # 1. BWM / GiftedTech — direct MP4 URLs, multiple qualities, no conversion needed
     if subject_id:

@@ -587,7 +587,7 @@ def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: i
             page.on("response", _on_response)
 
             try:
-                page.goto(proxy_url, timeout=30_000, wait_until="domcontentloaded")
+                page.goto(page_url, timeout=30_000, wait_until="domcontentloaded")
             except Exception as nav_err:
                 print(f"[playwright] nav error (continuing): {nav_err}", file=sys.stderr)
 

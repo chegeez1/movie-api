@@ -801,28 +801,9 @@ def _resolve_direct_source(stream: dict, ep: int, season: int, resolution: int, 
         except Exception as exc:
             print(f"[resolve] aoneroom: {exc}", file=sys.stderr)
 
-    # 3b. Aoneroom detail endpoint — trailer URL (unique per title, geo-unrestricted)
-    #     Falls back to this when subject/play is geo-blocked. Trailers are real content (1-30MB).
-    if detail_path:
-        try:
-            import urllib.request as _ureq
-            _det_url = f"https://h5-api.aoneroom.com/wefeed-h5api-bff/detail?detailPath={detail_path}"
-            _det_req = _ureq.Request(_det_url, headers={
-                "Referer": "https://netfilm.world/",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "x-client-info": '{"timezone":"UTC"}',
-                "Accept": "application/json",
-            })
-            import json as _json
-            with _ureq.urlopen(_det_req, timeout=8) as _r:
-                _det = _json.loads(_r.read())
-            _trailer = ((_det.get("data") or {}).get("subject") or {}).get("trailer") or {}
-            _turl = (_trailer.get("videoAddress") or {}).get("url", "") if isinstance(_trailer, dict) else ""
-            if _is_video_url(_turl):
-                print(f"[resolve] detail-trailer: {_turl[:80]}", file=sys.stderr)
-                return _turl, "detail_trailer"
-        except Exception as exc:
-            print(f"[resolve] detail-trailer: {exc}", file=sys.stderr)
+    # NOTE: step 3b (detail_trailer fallback) was removed — it returned trailer
+    # clips (1-30 MB) instead of full movie files, causing 1048/1049 downloads
+    # to be trailers. Never use trailer URLs as a download source.
 
     # 4. Playwright — loads the player page, intercepts JSON, captures CDN URL
     #    Semaphore ensures only one browser at a time to prevent crashes.

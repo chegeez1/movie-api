@@ -549,6 +549,10 @@ def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: i
             if "localhost" in url or "127.0.0.1" in url:
                 return
             # Direct video URL in the request itself (CDN hit)
+            # Explicitly skip images — webp/jpg/png/gif pass _is_video_url on aoneroom CDN domains
+            _IMG_EXTS = ('.webp', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico', '.bmp')
+            if any(url.lower().split("?")[0].endswith(e) for e in _IMG_EXTS):
+                return
             if _is_video_url(url) and url not in [c.get("url") for c in captured]:
                 vtype = "m3u8" if ".m3u8" in url else "mp4"
                 print(f"[playwright] CDN direct: {url}", file=sys.stderr)
@@ -643,12 +647,33 @@ def _playwright_warm_cache(subject_id: str, detail_path: str, ep: int, season: i
         return None
 
     if captured:
-        best = next((c for c in captured if c.get("type") == "m3u8"), captured[0])
-        url = best.get("url", "")
-        if _is_video_url(url):
-            print(f"[playwright] SUCCESS: {url[:100]}", file=sys.stderr)
-            _video_url_cache[vkey] = {**best, "ts": time.time()}
-            return url
+        # Filter to only real video streams — drop images, API endpoint URLs, etc.
+        _VIDEO_SIGS = (".mp4", ".m3u8", ".ts", ".webm")
+        _VIDEO_CDNS = ("pbcdnw.aoneroom.com", "pbcdn.aoneroom.com", "macdn.aoneroom.com", "cdn.aoneroom.com")
+        real = [
+            c for c in captured
+            if any(sig in c.get("url", "").lower() for sig in _VIDEO_SIGS)
+            or any(cdn in c.get("url", "") for cdn in _VIDEO_CDNS)
+        ]
+        if not real:
+            print(f"[playwright] captured {len(captured)} URLs but none are real video streams", file=sys.stderr)
+            for c in captured:
+                print(f"[playwright]  rejected: {c.get('url','')[:100]}", file=sys.stderr)
+        else:
+            # Prefer m3u8, then best mp4 quality (hd > sd > ld)
+            best = next((c for c in real if c.get("type") == "m3u8"), None)
+            if not best:
+                def _quality_rank(c):
+                    u = c.get("url", "").lower()
+                    if "-hd." in u or "1080" in u or "720" in u: return 0
+                    if "-sd." in u or "480" in u or "360" in u: return 1
+                    return 2  # -ld or unknown
+                best = sorted(real, key=_quality_rank)[0]
+            url = best.get("url", "")
+            if url:
+                print(f"[playwright] SUCCESS: {url}", file=sys.stderr)
+                _video_url_cache[vkey] = {**best, "ts": time.time()}
+                return url
 
     print(f"[playwright] No URL captured for {detail_path}", file=sys.stderr)
     return None

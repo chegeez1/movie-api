@@ -359,24 +359,28 @@ def _job_filepath(safe_title: str, ep: int, season: int, resolution: int):
     return filepath, filename
 
 
+_MIN_REAL_FILE_BYTES = 50 * 1024 * 1024  # 50 MB — trailers/previews are always smaller
+
+
 def _find_local_file(safe_title: str, ep: int, season: int) -> Optional[str]:
     """
     Return path to the best matching local file for a title/ep/season,
     or None. Prefers 1080p → 720p → any resolution.
+    Files under 50 MB are treated as trailers/corrupt downloads and ignored.
     """
     if not os.path.isdir(_DOWNLOAD_DIR):
         return None
     prefix = f"{safe_title}_s{season:02d}e{ep:02d}_"
     for res in ("1080p", "720p", "480p", "360p"):
         candidate = os.path.join(_DOWNLOAD_DIR, f"{prefix}{res}.mp4")
-        if os.path.exists(candidate) and os.path.getsize(candidate) > 512_000:
+        if os.path.exists(candidate) and os.path.getsize(candidate) >= _MIN_REAL_FILE_BYTES:
             return candidate
     # Fall back: any file with the prefix
     try:
         for fname in os.listdir(_DOWNLOAD_DIR):
             if fname.startswith(prefix) and fname.endswith(".mp4"):
                 fpath = os.path.join(_DOWNLOAD_DIR, fname)
-                if os.path.getsize(fpath) > 512_000:
+                if os.path.getsize(fpath) >= _MIN_REAL_FILE_BYTES:
                     return fpath
     except OSError:
         pass

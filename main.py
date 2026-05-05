@@ -157,6 +157,7 @@ _video_url_cache: dict = {}
 
 # ── VPS-disk download / local library ────────────────────────────────────────
 _DOWNLOAD_DIR = "/opt/movie-downloads"
+_LIBRARY_INDEX_FILE = os.path.join(_DOWNLOAD_DIR, ".library_index.json")
 # job_id → {status, progress, filepath, filename, size_mb, error, ts}
 _download_jobs: dict = {}
 # Keys already auto-queued so we don't re-fire on every page refresh
@@ -165,6 +166,50 @@ _auto_queued:   set  = set()
 _dl_semaphore = threading.Semaphore(3)
 # Limit concurrent Playwright browser sessions — only 1 at a time to avoid crashes
 _playwright_semaphore = threading.Semaphore(1)
+
+# ── Persistent library index (detail_path → movie metadata) ──────────────────
+# Survives API restarts; written to disk after every successful download.
+_lib_index: dict  = {}          # keyed by detail_path
+_lib_index_lock = threading.Lock()
+
+def _load_lib_index() -> None:
+    """Load library index from disk into memory on startup."""
+    global _lib_index
+    try:
+        if os.path.isfile(_LIBRARY_INDEX_FILE):
+            with open(_LIBRARY_INDEX_FILE, "r") as f:
+                _lib_index = json.load(f)
+            print(f"[lib-index] Loaded {len(_lib_index)} entries from disk", file=sys.stderr)
+    except Exception as exc:
+        print(f"[lib-index] Load failed: {exc}", file=sys.stderr)
+        _lib_index = {}
+
+def _save_lib_entry(detail_path: str, stream: dict, size_mb: float = 0) -> None:
+    """Persist a single movie/series entry to the library index."""
+    global _lib_index
+    entry = {
+        "id":          stream.get("id", ""),
+        "detail_path": detail_path,
+        "title":       stream.get("title", ""),
+        "type":        "series" if stream.get("is_series") else "movie",
+        "year":        (stream.get("release_date") or "")[:4],
+        "imdb_rating": stream.get("imdb_rating"),
+        "poster_url":  stream.get("cover_url"),
+        "size_mb":     round(size_mb, 1),
+    }
+    with _lib_index_lock:
+        _lib_index[detail_path] = entry
+        try:
+            os.makedirs(_DOWNLOAD_DIR, exist_ok=True)
+            tmp = _LIBRARY_INDEX_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(_lib_index, f)
+            os.replace(tmp, _LIBRARY_INDEX_FILE)
+        except Exception as exc:
+            print(f"[lib-index] Save failed: {exc}", file=sys.stderr)
+
+# Load index at import time
+_load_lib_index()
 
 # ── Bulk library builder state ────────────────────────────────────────────────
 _bulk_active  = False          # True while bulk builder is running
@@ -822,6 +867,9 @@ def _auto_download_worker(stream: dict, ep: int, season: int, resolution: int = 
             print(f"[auto-dl] {filename} via {src_name} (direct)", file=sys.stderr)
             _run_download_job(job_id, direct_url, filepath, filename, is_embed=False)
             if _download_jobs[job_id]["status"] == "ready":
+                detail_path = stream.get("detail_path", "")
+                if detail_path:
+                    _save_lib_entry(detail_path, stream, _download_jobs[job_id].get("size_mb", 0))
                 return
             print(f"[auto-dl] Direct source failed, trying embeds", file=sys.stderr)
 
@@ -1700,24 +1748,23 @@ async def local_library():
 @app.get("/local-library-movies")
 async def local_library_movies(limit: int = Query(500)):
     """
-    Return downloaded titles as Movie objects by cross-referencing the stream cache.
-    Only titles whose stream data is cached (populated during bulk download) are returned.
+    Return downloaded titles as Movie objects.
+    Primary source: persistent library index (_lib_index, survives restarts).
+    Fallback: cross-reference in-memory stream cache (catches titles from this session).
     """
     import re as _re
     _ensure_download_dir()
 
-    # Build safe_title → size_mb map from disk
+    # Build safe_title → size_mb map from disk (for total count + size updates)
     downloaded: dict[str, float] = {}
     if os.path.isdir(_DOWNLOAD_DIR):
         for fname in os.listdir(_DOWNLOAD_DIR):
             if not fname.endswith(".mp4"):
                 continue
             stem = fname[:-4]
-            # Strip _###p resolution suffix
             p = stem.rsplit("_", 1)
             if len(p) == 2 and p[1].endswith("p") and p[1][:-1].isdigit():
                 stem = p[0]
-            # Strip _s##e## suffix
             m = _re.search(r"_s\d{2}e\d{2}$", stem)
             if m:
                 stem = stem[: m.start()]
@@ -1727,9 +1774,19 @@ async def local_library_movies(limit: int = Query(500)):
                 sz = 0
             downloaded[stem] = sz
 
-    # Cross-reference with stream cache
-    movies = []
-    seen: set = set()
+    movies: dict[str, dict] = {}  # detail_path → movie entry
+
+    # 1) Load from persistent index (most entries, survives restarts)
+    with _lib_index_lock:
+        index_snapshot = dict(_lib_index)
+    for detail_path, entry in index_snapshot.items():
+        title = entry.get("title", "")
+        safe  = _safe_name(title)[:60]
+        if safe in downloaded:
+            movies[detail_path] = dict(entry)
+            movies[detail_path]["size_mb"] = round(downloaded.get(safe, 0), 1)
+
+    # 2) Supplement with in-memory stream cache (new downloads this session)
     for key, entry in list(_cache.items()):
         if not key.startswith("stream:"):
             continue
@@ -1737,11 +1794,12 @@ async def local_library_movies(limit: int = Query(500)):
         if not s:
             continue
         detail_path = s.get("detail_path", "") or key[7:]
+        if not detail_path or detail_path in movies:
+            continue
         title = s.get("title", "")
-        safe = _safe_name(title)[:60]
-        if safe in downloaded and detail_path not in seen:
-            seen.add(detail_path)
-            movies.append({
+        safe  = _safe_name(title)[:60]
+        if safe in downloaded:
+            movies[detail_path] = {
                 "id":          s.get("id", ""),
                 "detail_path": detail_path,
                 "title":       title,
@@ -1750,14 +1808,14 @@ async def local_library_movies(limit: int = Query(500)):
                 "imdb_rating": s.get("imdb_rating"),
                 "poster_url":  s.get("cover_url"),
                 "size_mb":     round(downloaded.get(safe, 0), 1),
-            })
+            }
 
-    movies.sort(key=lambda x: x["title"].lower())
+    sorted_movies = sorted(movies.values(), key=lambda x: x.get("title", "").lower())
     return {
         "status": "success",
-        "count":  len(movies),
+        "count":  len(sorted_movies),
         "total":  len(downloaded),
-        "data":   {"movies": movies[:limit]},
+        "data":   {"movies": sorted_movies[:limit]},
     }
 
 

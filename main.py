@@ -10,6 +10,7 @@ from typing import Optional
 import asyncio
 import os
 import subprocess
+import sys
 import threading
 import time
 import re

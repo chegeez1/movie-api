@@ -2037,16 +2037,11 @@ async def download_file_by_job(job_id: str):
     filepath = job["filepath"]
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="File missing from disk")
-    filename = job["filename"]
-    return Response(
-        status_code=200,
-        headers={
-            "X-Accel-Redirect":    f"/_video_files/{os.path.basename(filepath)}",
-            "X-Accel-Buffering":   "yes",
-            "Content-Type":        "application/octet-stream",
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Accept-Ranges":       "bytes",
-        },
+    return FileResponse(
+        filepath,
+        media_type="application/octet-stream",
+        filename=job["filename"],
+        headers={"Content-Disposition": f'attachment; filename="{job["filename"]}"'},
     )
 
 
@@ -2479,20 +2474,16 @@ async def download_movie(
     video_info = None
     dl_source  = "none"
 
-    # 0a. VPS local library — serve from disk via X-Accel-Redirect (nginx sendfile, fastest)
+    # 0a. VPS local library — serve from disk if already downloaded (fastest)
     local_path = _find_local_file(safe_title, ep, season)
     if local_path:
         local_name = os.path.basename(local_path)
-        print(f"[download] Serving from VPS disk via X-Accel-Redirect: {local_name}", file=sys.stderr)
-        return Response(
-            status_code=200,
-            headers={
-                "X-Accel-Redirect":    f"/_video_files/{local_name}",
-                "X-Accel-Buffering":   "yes",
-                "Content-Type":        "application/octet-stream",
-                "Content-Disposition": f'attachment; filename="{local_name}"',
-                "Accept-Ranges":       "bytes",
-            },
+        print(f"[download] Serving from VPS disk: {local_path}", file=sys.stderr)
+        return FileResponse(
+            local_path,
+            media_type="application/octet-stream",
+            filename=local_name,
+            headers={"Content-Disposition": f'attachment; filename="{local_name}"'},
         )
 
     # 0. BWM / GiftedTech — direct MP4 URLs; proxy through our server so mobile gets a real download
